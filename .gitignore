@@ -1,0 +1,13 @@
+.env
+google-credentials.json
+google-token.json
+processed_pos.json
+__pycache__/
+*.pyc
+venv/
+
+po_test.csv
+po_test_2.csv
+
+# WSL/Windows NTFS Alternate Data Stream artifacts
+*:Zone.Identifier
