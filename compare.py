@@ -14,6 +14,7 @@ class LineStatus(str, Enum):
 class POStatus(str, Enum):
     ALL_MATCH = "ALL_MATCH"
     NEEDS_REVIEW = "NEEDS_REVIEW"
+    NO_LINE_ITEMS = "NO_LINE_ITEMS"
 
 
 @dataclass
@@ -41,6 +42,8 @@ class POResult:
 
     @property
     def status(self) -> POStatus:
+        if not self.lines:
+            return POStatus.NO_LINE_ITEMS
         if any(line.status != LineStatus.OK for line in self.lines):
             return POStatus.NEEDS_REVIEW
         return POStatus.ALL_MATCH

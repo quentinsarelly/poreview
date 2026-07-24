@@ -19,6 +19,12 @@ def format_summary(result: POResult) -> str:
     lines = [
         f"{header_emoji} *PO {result.po_num}* ({result.retailer_name}) — {result.status.value}",
     ]
+    if result.status == POStatus.NO_LINE_ITEMS:
+        lines.append(
+            "_No line item data synced from Spring Systems yet — nothing to compare. "
+            "Re-run once the PO has line items._"
+        )
+        return "\n".join(lines)
     for line in result.lines:
         emoji = _STATUS_EMOJI[line.status]
         if line.status == LineStatus.SKU_NOT_FOUND:
