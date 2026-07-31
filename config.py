@@ -24,6 +24,10 @@ class Config:
     # Optional: only needed when actually posting to Slack (not for --dry-run).
     slack_webhook_url: str | None
 
+    # Optional: only needed when running slack_listener.py (the /po-review slash command).
+    slack_bot_token: str | None
+    slack_app_token: str | None
+
     @classmethod
     def load(cls) -> "Config":
         return cls(
@@ -40,6 +44,8 @@ class Config:
                 "PRICE_SHEET_PRICE_COLUMN", "expected_unit_price"
             ),
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL") or None,
+            slack_bot_token=os.getenv("SLACK_BOT_TOKEN") or None,
+            slack_app_token=os.getenv("SLACK_APP_TOKEN") or None,
         )
 
 

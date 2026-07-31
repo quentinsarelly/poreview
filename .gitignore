@@ -11,3 +11,5 @@ po_test_2.csv
 
 # WSL/Windows NTFS Alternate Data Stream artifacts
 *:Zone.Identifier
+
+deploy/

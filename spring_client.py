@@ -49,6 +49,10 @@ class SpringSystemsClient:
     def get_pos_for_retailer(self, retailer_id: str) -> list[dict[str, Any]]:
         return self.get_pos("retailer_id", "eq", retailer_id)
 
+    def get_po_by_num(self, po_num: str) -> dict[str, Any] | None:
+        matches = self.get_pos("po_num", "eq", po_num)
+        return matches[0] if matches else None
+
 
 def _next_page_url(headers: dict[str, Any]) -> str | None:
     raw = headers.get("X-Pagination")
