@@ -28,6 +28,14 @@ class Config:
     slack_bot_token: str | None
     slack_app_token: str | None
 
+    # Optional: only needed for shipment-quantity checks (Camelot WMS), not for pricing checks.
+    camelot_soap_url: str | None
+    camelot_username: str | None
+    camelot_password: str | None
+    camelot_client_code: str | None
+    camelot_trading_partner: str | None
+    camelot_shipment_profile: str | None
+
     @classmethod
     def load(cls) -> "Config":
         return cls(
@@ -46,6 +54,12 @@ class Config:
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL") or None,
             slack_bot_token=os.getenv("SLACK_BOT_TOKEN") or None,
             slack_app_token=os.getenv("SLACK_APP_TOKEN") or None,
+            camelot_soap_url=os.getenv("CAMELOT_SOAP_URL") or None,
+            camelot_username=os.getenv("CAMELOT_USERNAME") or None,
+            camelot_password=os.getenv("CAMELOT_PASSWORD") or None,
+            camelot_client_code=os.getenv("CAMELOT_CLIENT") or None,
+            camelot_trading_partner=os.getenv("CAMELOT_TRADING_PARTNER") or None,
+            camelot_shipment_profile=os.getenv("CAMELOT_SHIPMENT_PROFILE") or None,
         )
 
 
