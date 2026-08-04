@@ -66,19 +66,36 @@ python main.py --inspect-status       # print raw po_acknowledge_status values (
 python main.py --force                # re-evaluate POs even if already marked processed
 python main.py --retailer-id <id>     # override SPRING_RETAILER_ID from .env
 python main.py --from-csv po.csv --dry-run   # test against a local CSV export, no API needed
-
-python main.py --check-shipment 10001964460-3841 S0461276 --dry-run   # shipment quantity check
 ```
 
 "New" is tracked in `processed_pos.json`; a PO is only skipped there once a
-non-dry-run run has posted it. `--check-shipment` is a one-off check and does
-not touch `processed_pos.json`.
+non-dry-run run has posted it.
 
 Some real POs come back from Spring with no line items yet synced
 (`<po_items><po_item/></po_items>`) — these are reported as `NO_LINE_ITEMS`
-rather than a false `ALL_MATCH`, and should be re-run later. A PO with no
-matching Camelot shipment (not yet shipped, or a wrong/not-yet-known shipment
-ID) is reported as `NOT_YET_SHIPPED` rather than a false `ALL_MATCH`.
+rather than a false `ALL_MATCH`, and should be re-run later.
+
+### Running a shipment quantity check
+
+```bash
+python main.py --check-shipment <po_num> <shipment_id> --dry-run
+```
+
+e.g.:
+
+```bash
+python main.py --check-shipment 10001964460-3841 S0461276 --dry-run
+```
+
+This takes **two arguments, not just the PO #**: the PO # from Spring, and
+Camelot's own shipment ID (e.g. `S0461276`), which you have to look up
+yourself in Camelot's UI — see the note above on why there's no automatic
+PO#→shipment lookup yet. `--dry-run` prints the result to the terminal; drop
+it to post to Slack via `SLACK_WEBHOOK_URL` instead. This is a one-off check
+and does not touch `processed_pos.json`.
+
+A PO with no matching Camelot shipment (not yet shipped, or a wrong/mistyped
+shipment ID) is reported as `NOT_YET_SHIPPED` rather than a false `ALL_MATCH`.
 
 ## Setting up the Slack slash commands
 
@@ -108,6 +125,16 @@ tunnel — it opens an outbound websocket connection to Slack.
 
 The listener does **not** touch `processed_pos.json` — both commands are ad
 hoc, one-off checks, independent of the batch CLI's dedup state.
+
+**Already have `/po-review` set up and just need to add `/po-ship-check`?**
+You only need step 4 again — no new app, no new tokens:
+1. Go to **https://api.slack.com/apps**, open the existing app.
+2. **Slash Commands** → **Create New Command** → name it `/po-ship-check`
+   (Request URL can be left blank/placeholder, same as `/po-review`).
+3. Add `CAMELOT_*` credentials to `.env` if you haven't (see the env var
+   table above) — the listener won't start without them.
+4. Restart `slack_listener.py` (or restart the systemd service, if it's
+   already installed as one) to pick up the new command.
 
 ### Running it as a background service (systemd)
 
