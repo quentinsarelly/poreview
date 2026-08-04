@@ -2,11 +2,16 @@
 WMS actually shipped, mirroring compare.py's pricing-check pattern but for
 quantities -- meant to run after a shipment posts and before invoicing.
 
-NOT yet confirmed: whether Camelot's ItemNumber (the SKU on a shipped line)
-matches product_vendor_item_num, the SKU convention compare.py already uses
-to join Spring PO lines against the price list. Verify this against a real
-shipped Target PO before trusting QTY_MISMATCH/UNEXPECTED_ITEM results --
-if the conventions differ, every line will falsely show as mismatched.
+The SKU join (Camelot ItemNumber <-> Spring product_vendor_item_num) is
+confirmed to match exactly, validated end-to-end against a real Target PO
+(2026-08-04: PO 10001964460-3841 / Camelot shipment S0461276, 12/12 lines
+matched on both SKU and quantity).
+
+Caller's responsibility: get the shipment dict from
+camelot_client.get_shipment_detail(shipment_id), not get_shipment_for_po --
+there's currently no reliable way to look up a Target shipment by PO # alone
+(see camelot_client.py's module docstring), so the Camelot shipment ID has
+to be supplied manually for now.
 """
 
 from dataclasses import dataclass

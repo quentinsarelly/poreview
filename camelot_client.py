@@ -20,13 +20,22 @@ Confirmed against the live API (2026-07-30):
 - A retailer PO # is not a valid `pDocument` value -- Camelot has its own
   shipment ID (e.g. "S0459771"). The PO # is stored in the shipment's
   `OrderRefNumber` field, not `PurchOrderNumber` (confirmed empty on a real
-  Target shipment). So looking up a shipment by PO # means pulling
-  GetOrderStatusDateRange over a window and matching OrderRefNumber --
-  there's no direct "look up by PO #" call.
+  Target shipment).
+- Confirmed Camelot's `ItemNumber` (the SKU on a shipped line) matches
+  `product_vendor_item_num` exactly -- validated end-to-end against a real
+  Target PO (12/12 lines matched on both SKU and quantity).
 
-NOT yet confirmed: whether Camelot's ItemNumber (the SKU on a shipped line)
-matches product_vendor_item_num, the SKU convention compare.py already uses
-to join Spring PO lines against the price list. See compare_shipment.py.
+KNOWN LIMITATION (confirmed 2026-08-04, not just untested): there is
+currently no working way to look up a Target/EDI shipment by PO # or date
+range. `find_shipment_id_for_po`/`GetOrderStatusDateRange` only ever returns
+DTC/TikTok orders (`OrderRefNumber` starting `#SSUS...`) -- confirmed zero
+Target-style refs across a 65-day window (1854 records) and a narrow window
+that directly covered a known Target shipment's actual ship date (60
+records, still zero). This isn't a date-range or profile issue; the call
+appears to structurally exclude EDI/wholesale shipments. Until a working
+search exists, the Camelot shipment ID (e.g. "S0461276") must be supplied
+manually (found via Camelot's own UI) -- use get_shipment_detail directly
+rather than get_shipment_for_po/find_shipment_id_for_po for Target POs.
 """
 
 from dataclasses import dataclass, field
@@ -118,7 +127,12 @@ class CamelotClient:
     ) -> str | None:
         """Search shipments in a date range (YYYY-MM-DD) and return the Camelot
         ShipmentID whose OrderRefNumber matches the given PO #, or None if no
-        shipment in that window matches (including if it hasn't shipped yet)."""
+        shipment in that window matches (including if it hasn't shipped yet).
+
+        CONFIRMED UNRELIABLE FOR TARGET/EDI POs -- see module docstring. Only
+        ever observed to return DTC/TikTok orders in testing. Kept around in
+        case it's useful for non-Target order types; don't use it as the PO#
+        lookup path for Target POs until Camelot confirms the right call."""
         resp = self._call(
             "GetOrderStatusDateRange",
             {**self._base_params(), "pBeginDate": begin_date, "pEndDate": end_date},
