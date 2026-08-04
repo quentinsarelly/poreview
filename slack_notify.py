@@ -3,6 +3,7 @@ import time
 import requests
 
 from compare import LineStatus, POResult, POStatus
+from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2
@@ -11,6 +12,19 @@ _STATUS_EMOJI = {
     LineStatus.OK: ":white_check_mark:",
     LineStatus.PRICE_MISMATCH: ":warning:",
     LineStatus.SKU_NOT_FOUND: ":question:",
+}
+
+_SHIPMENT_STATUS_EMOJI = {
+    ShipmentStatus.ALL_MATCH: ":white_check_mark:",
+    ShipmentStatus.NEEDS_REVIEW: ":rotating_light:",
+    ShipmentStatus.NOT_YET_SHIPPED: ":hourglass_flowing_sand:",
+}
+
+_SHIPMENT_LINE_EMOJI = {
+    ShipmentLineStatus.OK: ":white_check_mark:",
+    ShipmentLineStatus.QTY_MISMATCH: ":warning:",
+    ShipmentLineStatus.NOT_SHIPPED: ":x:",
+    ShipmentLineStatus.UNEXPECTED_ITEM: ":question:",
 }
 
 
@@ -45,8 +59,40 @@ def format_summary(result: POResult) -> str:
     return "\n".join(lines)
 
 
-def post_summary(result: POResult, webhook_url: str) -> None:
-    text = format_summary(result)
+def format_shipment_summary(result: ShipmentResult) -> str:
+    header_emoji = _SHIPMENT_STATUS_EMOJI[result.status]
+    lines = [f"{header_emoji} *PO {result.po_num}* shipment check — {result.status.value}"]
+
+    if result.status == ShipmentStatus.NOT_YET_SHIPPED:
+        lines.append("_No Camelot shipment found for that shipment ID._")
+        return "\n".join(lines)
+
+    lines.append(
+        f"Shipment `{result.shipment_id}` — status `{result.order_status}`, "
+        f"shipped {result.ship_date or '(no ship date)'}"
+    )
+    for line in result.lines:
+        emoji = _SHIPMENT_LINE_EMOJI[line.status]
+        if line.status == ShipmentLineStatus.NOT_SHIPPED:
+            lines.append(
+                f"{emoji} SKU `{line.sku}` — ordered {line.qty_ordered:g}, "
+                f"not found in the shipment"
+            )
+        elif line.status == ShipmentLineStatus.UNEXPECTED_ITEM:
+            lines.append(
+                f"{emoji} SKU `{line.sku}` — shipped {line.qty_shipped:g}, not on the PO"
+            )
+        elif line.status == ShipmentLineStatus.QTY_MISMATCH:
+            lines.append(
+                f"{emoji} SKU `{line.sku}` — ordered {line.qty_ordered:g}, "
+                f"shipped {line.qty_shipped:g} (delta {line.delta:+g})"
+            )
+        else:
+            lines.append(f"{emoji} SKU `{line.sku}` — qty {line.qty_shipped:g}")
+    return "\n".join(lines)
+
+
+def post_text(text: str, webhook_url: str) -> None:
     last_error: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
@@ -58,3 +104,11 @@ def post_summary(result: POResult, webhook_url: str) -> None:
             if attempt < _MAX_ATTEMPTS:
                 time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
     raise last_error
+
+
+def post_summary(result: POResult, webhook_url: str) -> None:
+    post_text(format_summary(result), webhook_url)
+
+
+def post_shipment_summary(result: ShipmentResult, webhook_url: str) -> None:
+    post_text(format_shipment_summary(result), webhook_url)

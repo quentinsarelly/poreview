@@ -9,6 +9,11 @@ Usage:
     python main.py --force                # re-evaluate POs even if already marked processed
     python main.py --retailer-id <id>     # override SPRING_RETAILER_ID from .env
     python main.py --from-csv po.csv --dry-run   # test against a local CSV export, no API needed
+
+    # One-off shipment quantity check (PO vs what Camelot actually shipped).
+    # There's no automatic PO#->shipment lookup for Target orders yet, so the
+    # Camelot shipment ID (e.g. S0461276) must be found manually in Camelot's UI.
+    python main.py --check-shipment 10001964460-3841 S0461276 --dry-run
 """
 
 import argparse
@@ -17,9 +22,11 @@ import sys
 import csv_po
 import price_list
 import state
+from camelot_client import CamelotClient
 from compare import evaluate_po
+from compare_shipment import evaluate_shipment
 from config import Config
-from slack_notify import format_summary, post_summary
+from slack_notify import format_shipment_summary, format_summary, post_shipment_summary, post_summary
 from spring_client import SpringSystemsClient
 
 
@@ -51,12 +58,104 @@ def parse_args() -> argparse.Namespace:
         help="Load PO(s) from a local Spring Systems CSV export instead of calling the API "
         "(for testing before API credentials are available).",
     )
+    parser.add_argument(
+        "--check-shipment",
+        nargs=2,
+        metavar=("PO_NUM", "SHIPMENT_ID"),
+        help="One-off shipment quantity check for a PO # against a Camelot shipment ID, "
+        "e.g. --check-shipment 10001964460-3841 S0461276. The Camelot shipment ID must be "
+        "found manually in Camelot's UI -- there's no working PO#->shipment lookup for "
+        "Target orders yet. Prints with --dry-run, otherwise posts to Slack.",
+    )
     return parser.parse_args()
+
+
+def _run_shipment_check(
+    po_num: str, shipment_id: str, config: Config, args: argparse.Namespace
+) -> int:
+    if args.from_csv:
+        po = next(
+            (p for p in csv_po.load_pos_from_csv(args.from_csv) if str(p.get("po_num")) == po_num),
+            None,
+        )
+    else:
+        missing = [
+            name
+            for name, value in [
+                ("SPRING_API_BASE_URL", config.spring_base_url),
+                ("SPRING_API_USER", config.spring_api_user),
+                ("SPRING_API_KEY", config.spring_api_key),
+            ]
+            if not value
+        ]
+        if missing:
+            print(
+                f"Missing required environment variable(s): {', '.join(missing)}. "
+                "Set them in .env, or use --from-csv.",
+                file=sys.stderr,
+            )
+            return 1
+        spring_client = SpringSystemsClient(
+            base_url=config.spring_base_url,
+            api_user=config.spring_api_user,
+            api_key=config.spring_api_key,
+        )
+        po = spring_client.get_po_by_num(po_num)
+
+    if po is None:
+        print(f"PO {po_num} not found.", file=sys.stderr)
+        return 1
+
+    camelot_missing = [
+        name
+        for name, value in [
+            ("CAMELOT_SOAP_URL", config.camelot_soap_url),
+            ("CAMELOT_USERNAME", config.camelot_username),
+            ("CAMELOT_PASSWORD", config.camelot_password),
+            ("CAMELOT_CLIENT", config.camelot_client_code),
+            ("CAMELOT_TRADING_PARTNER", config.camelot_trading_partner),
+            ("CAMELOT_SHIPMENT_PROFILE", config.camelot_shipment_profile),
+        ]
+        if not value
+    ]
+    if camelot_missing:
+        print(
+            f"Missing required environment variable(s): {', '.join(camelot_missing)}. "
+            "Set them in .env.",
+            file=sys.stderr,
+        )
+        return 1
+
+    camelot_client = CamelotClient(
+        soap_url=config.camelot_soap_url,
+        username=config.camelot_username,
+        password=config.camelot_password,
+        client_code=config.camelot_client_code,
+        trading_partner=config.camelot_trading_partner,
+        shipment_profile=config.camelot_shipment_profile,
+    )
+    shipment = camelot_client.get_shipment_detail(shipment_id)
+    result = evaluate_shipment(po, shipment)
+
+    if args.dry_run:
+        print(format_shipment_summary(result))
+        return 0
+
+    if not config.slack_webhook_url:
+        print("SLACK_WEBHOOK_URL is not set. Set it in .env or use --dry-run.", file=sys.stderr)
+        return 1
+    post_shipment_summary(result, config.slack_webhook_url)
+    print(f"Posted shipment check for PO {po_num} ({result.status.value}) to Slack.")
+    return 0
 
 
 def main() -> int:
     args = parse_args()
     config = Config.load()
+
+    if args.check_shipment:
+        po_num, shipment_id = args.check_shipment
+        return _run_shipment_check(po_num, shipment_id, config, args)
 
     if args.from_csv:
         pos = csv_po.load_pos_from_csv(args.from_csv)
