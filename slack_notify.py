@@ -18,6 +18,7 @@ _SHIPMENT_STATUS_EMOJI = {
     ShipmentStatus.ALL_MATCH: ":white_check_mark:",
     ShipmentStatus.NEEDS_REVIEW: ":rotating_light:",
     ShipmentStatus.NOT_YET_SHIPPED: ":hourglass_flowing_sand:",
+    ShipmentStatus.AWAITING_CONFIRMATION: ":package:",
 }
 
 _SHIPMENT_LINE_EMOJI = {
@@ -65,6 +66,16 @@ def format_shipment_summary(result: ShipmentResult) -> str:
 
     if result.status == ShipmentStatus.NOT_YET_SHIPPED:
         lines.append("_No Camelot shipment found for that shipment ID._")
+        return "\n".join(lines)
+
+    if result.status == ShipmentStatus.AWAITING_CONFIRMATION:
+        lines.append(
+            f"Shipment `{result.shipment_id}` exists in Camelot (status "
+            f"`{result.order_status}`) but has no line-level quantities yet — "
+            "the warehouse hasn't run ship-confirm. Nothing to compare until "
+            "that's done. :point_right: ping the warehouse to confirm this "
+            "shipment in Camelot."
+        )
         return "\n".join(lines)
 
     lines.append(

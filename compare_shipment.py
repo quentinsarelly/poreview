@@ -32,6 +32,10 @@ class ShipmentStatus(str, Enum):
     ALL_MATCH = "ALL_MATCH"
     NEEDS_REVIEW = "NEEDS_REVIEW"
     NOT_YET_SHIPPED = "NOT_YET_SHIPPED"  # no Camelot shipment found for this PO yet
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"  # shipment exists in Camelot but
+    # has no ShipLine records yet -- the warehouse hasn't run ship-confirm, so there
+    # is no shipped-quantity data to compare against yet (seen with order_status
+    # "Printed": packing slip printed, ship not yet confirmed in the WMS).
 
 
 @dataclass
@@ -53,11 +57,14 @@ class ShipmentResult:
     order_status: str | None
     ship_date: str | None
     lines: list[ShipmentLineResult]
+    awaiting_confirmation: bool = False
 
     @property
     def status(self) -> ShipmentStatus:
         if self.shipment_id is None:
             return ShipmentStatus.NOT_YET_SHIPPED
+        if self.awaiting_confirmation:
+            return ShipmentStatus.AWAITING_CONFIRMATION
         if any(line.status != ShipmentLineStatus.OK for line in self.lines):
             return ShipmentStatus.NEEDS_REVIEW
         return ShipmentStatus.ALL_MATCH
@@ -71,6 +78,20 @@ def evaluate_shipment(
     if shipment is None:
         return ShipmentResult(
             po_num=po_num, shipment_id=None, order_status=None, ship_date=None, lines=[]
+        )
+
+    if not shipment.get("lines"):
+        # Shipment header exists in Camelot (it has a ShipmentID and status),
+        # but the warehouse hasn't run ship-confirm yet, so there are no
+        # ShipLine records to compare against -- reporting every ordered SKU
+        # as NOT_SHIPPED here would be a false alarm, not a real mismatch.
+        return ShipmentResult(
+            po_num=po_num,
+            shipment_id=shipment.get("shipment_id"),
+            order_status=shipment.get("order_status"),
+            ship_date=shipment.get("ship_date"),
+            lines=[],
+            awaiting_confirmation=True,
         )
 
     ordered: dict[str, float] = {}

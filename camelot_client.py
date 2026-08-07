@@ -25,6 +25,20 @@ Confirmed against the live API (2026-07-30):
   `product_vendor_item_num` exactly -- validated end-to-end against a real
   Target PO (12/12 lines matched on both SKU and quantity).
 
+KNOWN LIMITATION (confirmed 2026-08-07): before a shipment is ship-confirmed
+in Camelot (OrderStatus like "Printed"), there is no per-SKU "Qty Ordered /
+Qty to Ship" data available via this SOAP API -- only the shipment's header
+fields are populated; ShipLine is empty and TotalQtyOrdered is 0. Confirmed
+by testing GetOrderStatusDetail across pDocType 0-4 (only 0 resolves, always
+the same empty-lines shape) and GetTransactionStatusDetail (identical
+result) against a real pending shipment (S0461171). The WMS web portal's
+"Qty to Ship" column is apparently sourced from pick-ticket/wave data not
+exposed by any read call in this account's WSDL. Decision: don't chase this
+further for now -- compare_shipment.py's AWAITING_CONFIRMATION status (no
+per-line comparison, just a warehouse nudge) is the intended behavior for
+shipments in this state, not a gap to fill in later without new information
+(e.g. from Camelot support).
+
 KNOWN LIMITATION (confirmed 2026-08-04, not just untested): there is
 currently no working way to look up a Target/EDI shipment by PO # or date
 range. `find_shipment_id_for_po`/`GetOrderStatusDateRange` only ever returns
