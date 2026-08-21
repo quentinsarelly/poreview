@@ -13,6 +13,8 @@ class Config:
     spring_api_user: str | None
     spring_api_key: str | None
     spring_retailer_id: str | None
+    # Optional: only needed for --create-invoice (our own vendor tp_id in Spring).
+    spring_vendor_id: str | None
 
     google_sheet_id: str
     google_credentials_path: str
@@ -36,6 +38,15 @@ class Config:
     camelot_trading_partner: str | None
     camelot_shipment_profile: str | None
 
+    # Optional: only needed for --push-odoo-invoice.
+    odoo_db_url: str | None
+    odoo_db_name: str | None
+    odoo_user: str | None
+    odoo_api_key: str | None
+    odoo_company_id: str | None
+    odoo_journal_id: str | None
+    odoo_target_partner_id: str | None
+
     @classmethod
     def load(cls) -> "Config":
         return cls(
@@ -43,6 +54,7 @@ class Config:
             spring_api_user=os.getenv("SPRING_API_USER"),
             spring_api_key=os.getenv("SPRING_API_KEY"),
             spring_retailer_id=os.getenv("SPRING_RETAILER_ID"),
+            spring_vendor_id=os.getenv("SPRING_VENDOR_ID"),
             google_sheet_id=_require("GOOGLE_SHEET_ID"),
             google_credentials_path=_require("GOOGLE_CREDENTIALS_PATH"),
             google_token_path=os.getenv("GOOGLE_TOKEN_PATH", "./google-token.json"),
@@ -60,6 +72,13 @@ class Config:
             camelot_client_code=os.getenv("CAMELOT_CLIENT") or None,
             camelot_trading_partner=os.getenv("CAMELOT_TRADING_PARTNER") or None,
             camelot_shipment_profile=os.getenv("CAMELOT_SHIPMENT_PROFILE") or None,
+            odoo_db_url=os.getenv("ODOO_DB_URL") or None,
+            odoo_db_name=os.getenv("ODOO_DB_NAME") or None,
+            odoo_user=os.getenv("ODOO_USER") or None,
+            odoo_api_key=os.getenv("ODOO_API_KEY") or None,
+            odoo_company_id=os.getenv("ODOO_COMPANY_ID") or None,
+            odoo_journal_id=os.getenv("ODOO_JOURNAL_ID") or None,
+            odoo_target_partner_id=os.getenv("ODOO_TARGET_PARTNER_ID") or None,
         )
 
 

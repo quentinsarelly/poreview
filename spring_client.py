@@ -53,6 +53,67 @@ class SpringSystemsClient:
         matches = self.get_pos("po_num", "eq", po_num)
         return matches[0] if matches else None
 
+    def get_invoices(self, attr: str, op: str, value: str) -> list[dict[str, Any]]:
+        """Fetch all invoices matching a single filter condition, e.g.
+        attr="invoice_created", op="gte", value="2026-08-14", following pagination
+        until exhausted. Same URL-embedded api_user/api_key auth as get_pos -- the
+        export/GET endpoints use that pattern (confirmed live), distinct from the
+        Basic-auth pattern the POST /send/ endpoints document."""
+        url: str | None = (
+            f"{self.base_url.rstrip('/')}/invoice-outgoing/export/"
+            f"invoice.filter.{op}.{attr}/{value}/"
+            f"api_user/{self.api_user}/api_key/{self.api_key}"
+        )
+        invoices: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        while url and url not in seen_urls:
+            seen_urls.add(url)
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            invoices.extend(_parse_invoices_xml(response.text))
+            url = _next_page_url(response.headers)
+        return invoices
+
+    def get_invoices_created_since(self, date: str) -> list[dict[str, Any]]:
+        """date: YYYY-MM-DD. Returns invoices created on or after that date."""
+        return self.get_invoices("invoice_created", "gte", date)
+
+    def create_invoice(
+        self,
+        po: dict[str, Any],
+        invoice_num: str,
+        vendor_tp_id: str,
+        invoice_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Create/send an invoice for a PO's full line items (qty/price as ordered --
+        intended to run only after evaluate_po has already confirmed pricing).
+
+        WARNING -- unconfirmed draft-vs-send behavior: Spring's docs do not document
+        any way to create a "draft" invoice distinct from one that's immediately
+        transmitted (EDI 810) to the retailer. This hits the same /send/-style
+        endpoint used to create/acknowledge POs, so it may transmit the moment this
+        is called. Confirm actual behavior with Spring Systems support, or with a
+        deliberate low-stakes real test, before relying on this for anything beyond
+        --dry-run.
+
+        invoice_date placement (<invoice_additional><attributes><invoice_date>) is
+        inferred from the export/GET schema (springsystems.readme.io/reference/
+        invoice-sample-data), not from a confirmed request example -- the live "Try
+        It" example for this endpoint didn't include a date field at all. Verify
+        this lands correctly on the created invoice before trusting it.
+        """
+        invoices_xml = build_invoice_request_xml(po, invoice_num, vendor_tp_id, invoice_date)
+        url = f"{self.base_url.rstrip('/')}/invoice-incoming/send"
+        response = self.session.post(
+            url,
+            data=ElementTree.tostring(invoices_xml, encoding="unicode"),
+            auth=(self.api_user, self.api_key),
+            headers={"Content-Type": "application/xml"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return _parse_invoice_send_response(response.text)
+
 
 def _next_page_url(headers: dict[str, Any]) -> str | None:
     raw = headers.get("X-Pagination")
@@ -87,6 +148,7 @@ def _parse_po_element(po_el: ElementTree.Element) -> dict[str, Any]:
             product_el = item_el.find("product")
             items.append(
                 {
+                    "po_item_id": _text(item_el, "po_item_id"),
                     "po_item_qty_ordered": _text(item_el, "po_item_qty_ordered"),
                     "po_item_unit_price": _text(item_el, "po_item_unit_price"),
                     "po_item_buyer_item_num": _text(item_el, "po_item_buyer_item_num"),
@@ -113,3 +175,82 @@ def get_line_items(po: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(item, dict):
         return [item]
     return item or []
+
+
+def _parse_invoice_element(invoice_el: ElementTree.Element) -> dict[str, Any]:
+    retailer_el = invoice_el.find("retailer")
+    return {
+        "invoice_id": _text(invoice_el, "invoice_id"),
+        "invoice_num": _text(invoice_el, "invoice_num"),
+        "invoice_amount": _text(invoice_el, "invoice_amount"),
+        "invoice_status": _text(invoice_el, "invoice_status"),
+        "invoice_created": _text(invoice_el, "invoice_created"),
+        "retailer_id": _text(invoice_el, "retailer_id"),
+        "retailer": {"retailer_name": _text(retailer_el, "tp_name")},
+    }
+
+
+def _parse_invoices_xml(xml_text: str) -> list[dict[str, Any]]:
+    root = ElementTree.fromstring(xml_text)
+    return [_parse_invoice_element(el) for el in root.findall("invoice")]
+
+
+def build_invoice_request_xml(
+    po: dict[str, Any],
+    invoice_num: str,
+    vendor_tp_id: str,
+    invoice_date: str | None,
+) -> ElementTree.Element:
+    line_items = get_line_items(po)
+    if not line_items:
+        raise ValueError(f"PO {po.get('po_num')!r} has no line items to invoice.")
+    missing_ids = [i for i, item in enumerate(line_items) if not item.get("po_item_id")]
+    if missing_ids:
+        raise ValueError(
+            f"PO {po.get('po_num')!r} line item(s) at index {missing_ids} are missing "
+            "po_item_id -- required to invoice against them. (POs loaded via --from-csv "
+            "never have this; fetch the PO from the live API instead.)"
+        )
+
+    total = sum(
+        float(item.get("po_item_qty_ordered", 0) or 0) * float(item.get("po_item_unit_price", 0) or 0)
+        for item in line_items
+    )
+
+    invoices_el = ElementTree.Element("invoices")
+    invoice_el = ElementTree.SubElement(invoices_el, "invoice")
+    ElementTree.SubElement(invoice_el, "invoice_num").text = invoice_num
+    ElementTree.SubElement(invoice_el, "invoice_amount").text = f"{total:.2f}"
+    ElementTree.SubElement(ElementTree.SubElement(invoice_el, "vendor"), "tp_id").text = str(vendor_tp_id)
+    ElementTree.SubElement(ElementTree.SubElement(invoice_el, "retailer"), "tp_id").text = str(
+        po.get("retailer_id", "")
+    )
+    if invoice_date:
+        attrs_el = ElementTree.SubElement(ElementTree.SubElement(invoice_el, "invoice_additional"), "attributes")
+        ElementTree.SubElement(attrs_el, "invoice_date").text = invoice_date
+
+    invoice_po_el = ElementTree.SubElement(invoice_el, "invoice_po")
+    ElementTree.SubElement(invoice_po_el, "po_id").text = str(po.get("po_id", ""))
+    for item in line_items:
+        item_el = ElementTree.SubElement(invoice_po_el, "invoice_po_item")
+        ElementTree.SubElement(item_el, "po_item_id").text = str(item["po_item_id"])
+        ElementTree.SubElement(item_el, "invoice_po_item_qty").text = str(item.get("po_item_qty_ordered", ""))
+        ElementTree.SubElement(item_el, "invoice_po_item_price").text = str(item.get("po_item_unit_price", ""))
+
+    return invoices_el
+
+
+def _parse_invoice_send_response(xml_text: str) -> dict[str, Any]:
+    root = ElementTree.fromstring(xml_text)
+    errors_el = root.find("errors")
+    if errors_el is not None:
+        raise RuntimeError(f"Spring invoice send failed: {(errors_el.text or '').strip()}")
+    invoice_el = root.find("invoice")
+    if invoice_el is None:
+        raise RuntimeError(f"Spring invoice send returned no <invoice>: {xml_text}")
+    return {
+        "invoice_id": _text(invoice_el, "invoice_id"),
+        "invoice_num": _text(invoice_el, "invoice_num"),
+        "invoice_amount": _text(invoice_el, "invoice_amount"),
+        "invoice_status": _text(invoice_el, "invoice_status"),
+    }
