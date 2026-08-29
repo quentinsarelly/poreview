@@ -136,6 +136,14 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
             f"*Invoice date* `{prep.invoice_date}`  _(Camelot ship date)_",
             f"*Total* {prep.total:,.2f}",
         ]
+        skipped = prep.number_resolution.skipped if prep.number_resolution else []
+        if skipped:
+            detail.append(
+                ":information_source: _"
+                + "; ".join(skipped)
+                + f" — using `{prep.invoice_num}` instead. Another PO shipped to the "
+                "same DC on the same day._"
+            )
         check = prep.ship_date_check
         if check and check.spring_asn_date:
             detail.append(
@@ -156,7 +164,9 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
             )
         )
 
-    if ready:
+    # invoice_num is always set when nothing blocks, but attaching a confirm
+    # button with a null number would be worse than showing none at all.
+    if ready and prep.invoice_num:
         blocks.append(
             {
                 "type": "actions",

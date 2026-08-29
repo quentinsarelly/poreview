@@ -190,6 +190,13 @@ def _parse_invoice_element(invoice_el: ElementTree.Element) -> dict[str, Any]:
         "invoice_amount": _text(invoice_el, "invoice_amount"),
         "invoice_status": _text(invoice_el, "invoice_status"),
         "invoice_created": _text(invoice_el, "invoice_created"),
+        # Which PO this invoice was raised against. Needed to tell "this PO is
+        # already invoiced" apart from "a different PO took that number" --
+        # the invoice endpoint silently returns 0 results for a po_num/po_id
+        # filter (HTTP 200, empty list) rather than erroring, so filtering by
+        # PO is not an option and the link has to be read off the invoice.
+        "po_num": _text(invoice_el, "invoice_po/po/po_num"),
+        "po_id": _text(invoice_el, "invoice_po/po_id"),
         "retailer_id": _text(invoice_el, "retailer_id"),
         "retailer": {"retailer_name": _text(retailer_el, "tp_name")},
     }

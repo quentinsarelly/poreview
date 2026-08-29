@@ -49,18 +49,31 @@ class OdooClient:
         ids = self.execute("product.product", "search", [["default_code", "=", sku]], limit=1)
         return ids[0] if ids else None
 
-    def find_invoice_by_reference(self, invoice_num: str) -> int | None:
+    def find_invoice_by_reference(self, invoice_num: str) -> dict[str, Any] | None:
         """Existing customer invoice carrying this invoice number, in any state
-        (draft included). Guards against a double-click on the Slack confirm
-        button creating two drafts for the same shipment -- Odoo has no
-        uniqueness constraint on payment_reference of its own."""
+        (draft included), or None.
+
+        Returns `ref` (which holds the PO number) alongside the id, because the
+        caller has to tell "this PO is already invoiced" apart from "a different
+        PO to the same DC already took this number" -- those need opposite
+        responses. Also guards against a double-click on the Slack confirm
+        button, since Odoo has no uniqueness constraint on payment_reference.
+        """
         ids = self.execute(
             "account.move",
             "search",
             [["payment_reference", "=", invoice_num], ["move_type", "=", "out_invoice"]],
             limit=1,
         )
-        return ids[0] if ids else None
+        if not ids:
+            return None
+        rows = self.execute(
+            "account.move",
+            "read",
+            ids,
+            fields=["id", "ref", "payment_reference", "state", "invoice_date", "amount_total"],
+        )
+        return rows[0] if rows else None
 
     def create_draft_invoice(
         self,

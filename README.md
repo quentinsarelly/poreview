@@ -208,9 +208,24 @@ Runs the whole flow and stops at the first thing that isn't right:
 4. **Invoice number** — derived as `TAR` + `YYMMDD` (ship date) + the PO's
    trailing 2 digits (its Target DC code). PO `10001993952-3840` shipped
    `2026-08-18` → `TAR26081840`.
-5. **Duplicate check** — Spring and Odoo are both searched for that invoice
-   number, since two POs to the same DC shipping the same day would otherwise
-   derive the same one.
+5. **Duplicate / collision check** — Spring and Odoo are both searched.
+   - If **this PO** already has an invoice, it stops: *"PO … is already
+     invoiced as TAR26082740 (Odoo account.move=2705938 (draft))"*. No button.
+   - If a **different PO** holds the derived number — two POs to the same DC
+     shipping the same day, which does happen — it moves to the next free
+     letter (`TAR26082740` → `TAR26082740B` → `TAR26082740C`) and says which
+     number it skipped and why.
+
+   Order matters: this PO is checked for an existing invoice *before* a new
+   number is allocated. "Take the next free number" on its own would give an
+   already-invoiced PO a fresh suffix on every re-run.
+
+   Letters rather than `-2` keep the number strictly alphanumeric, since it
+   lands in the EDI 810's BIG02 field where punctuation risks being rejected.
+
+   Note Spring cannot be queried by PO: `invoice.filter.eq.po_num` answers
+   HTTP 200 with an empty list instead of erroring (confirmed 2026-08-29), so
+   the owning PO is read off each candidate invoice instead.
 
 If anything blocks, Slack shows every blocker at once and no button. If
 everything passes, it posts the derived invoice number, date and total with a

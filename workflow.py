@@ -347,8 +347,87 @@ def list_invoices_since(clients: Clients, date_str: str) -> list[dict[str, Any]]
 
 
 def find_spring_invoice(clients: Clients, invoice_num: str) -> dict[str, Any] | None:
+    """Look an invoice up by number.
+
+    Only invoice_num is usable as a filter here: the invoice endpoint accepts
+    a po_num/po_id filter but silently answers HTTP 200 with an empty list
+    instead of erroring, so filtering by PO would always look like "no invoice
+    exists". Confirmed live 2026-08-29. The owning PO is read off the returned
+    invoice (po_num) instead.
+    """
     matches = clients.spring.get_invoices("invoice_num", "eq", invoice_num)
     return matches[0] if matches else None
+
+
+@dataclass
+class InvoiceNumberResolution:
+    """Which invoice number a PO should use, or why it can't have one."""
+
+    invoice_num: str | None = None
+    # Set when this PO already has an invoice -- a re-run, not a collision.
+    already_invoiced_as: str | None = None
+    already_invoiced_where: list[str] = field(default_factory=list)
+    # Numbers skipped because a *different* PO owns them.
+    skipped: list[str] = field(default_factory=list)
+
+
+def resolve_invoice_num(
+    clients: Clients, po_num: str, base: str, *, check_odoo: bool = True
+) -> InvoiceNumberResolution:
+    """Walk base, base+B, base+C ... and return the first number free in both
+    Spring and Odoo -- unless this PO already owns one, which stops the walk.
+
+    That ordering is what makes re-runs safe. Allocating "the next free number"
+    without first checking whether this PO already has one would hand a second
+    number to a PO that was already invoiced, every single re-run.
+    """
+    resolution = InvoiceNumberResolution()
+
+    for candidate in invoicing.invoice_num_candidates(base):
+        owners: list[tuple[str, str, str]] = []  # (system, owning po_num, detail)
+
+        spring_invoice = find_spring_invoice(clients, candidate)
+        if spring_invoice:
+            owners.append(
+                (
+                    "Spring",
+                    str(spring_invoice.get("po_num") or ""),
+                    f"Spring invoice_id={spring_invoice.get('invoice_id')} "
+                    f"created {spring_invoice.get('invoice_created')}",
+                )
+            )
+
+        if check_odoo:
+            odoo_invoice = clients.odoo.find_invoice_by_reference(candidate)
+            if odoo_invoice:
+                owners.append(
+                    (
+                        "Odoo",
+                        str(odoo_invoice.get("ref") or ""),
+                        f"Odoo account.move={odoo_invoice.get('id')} "
+                        f"({odoo_invoice.get('state')})",
+                    )
+                )
+
+        if not owners:
+            resolution.invoice_num = candidate
+            return resolution
+
+        mine = [o for o in owners if o[1] == po_num]
+        if mine:
+            resolution.already_invoiced_as = candidate
+            resolution.already_invoiced_where = [detail for _, _, detail in mine]
+            return resolution
+
+        resolution.skipped.append(
+            f"{candidate} (taken by PO {owners[0][1] or 'unknown'})"
+        )
+
+    raise WorkflowError(
+        f"Every invoice number from {base} through {base}Z is already in use. "
+        "That's 26 invoices to the same DC on the same ship date -- check for a "
+        "derivation problem before forcing this through."
+    )
 
 
 # --- /po-invoice: check everything, then derive ---------------------------
@@ -369,6 +448,9 @@ class InvoicePreparation:
     invoice_num: str | None
     total: float
     blockers: list[str]
+    # How invoice_num was arrived at -- which numbers were skipped because
+    # another PO owns them, or which number this PO already holds.
+    number_resolution: "InvoiceNumberResolution | None" = None
 
     @property
     def ready(self) -> bool:
@@ -426,23 +508,32 @@ def prepare_invoice(
     except invoicing.DerivationError as e:
         blockers.append(str(e))
 
+    resolution: InvoiceNumberResolution | None = None
     if invoice_num:
-        existing = find_spring_invoice(clients, invoice_num)
-        if existing:
-            blockers.append(
-                f"Spring already has invoice {invoice_num} "
-                f"(id={existing.get('invoice_id')}, created {existing.get('invoice_created')})."
-            )
+        base = invoice_num
         try:
             require_odoo_env(clients.config)
-            existing_move = clients.odoo.find_invoice_by_reference(invoice_num)
-            if existing_move:
-                blockers.append(
-                    f"Odoo already has an invoice with reference {invoice_num} "
-                    f"(account.move id={existing_move})."
-                )
+            check_odoo = True
         except WorkflowError as e:
+            # Without Odoo we can't see half the picture, so don't hand out a
+            # number that might already be taken there -- block instead.
             blockers.append(str(e))
+            check_odoo = False
+
+        if check_odoo:
+            resolution = resolve_invoice_num(clients, po_num, base, check_odoo=True)
+            if resolution.already_invoiced_as:
+                invoice_num = None
+                blockers.append(
+                    f"PO {po_num} is already invoiced as "
+                    f"{resolution.already_invoiced_as} "
+                    f"({'; '.join(resolution.already_invoiced_where)}). "
+                    "Nothing to do -- reconcile manually if that's not what you expect."
+                )
+            else:
+                invoice_num = resolution.invoice_num
+        else:
+            invoice_num = None
 
     total = sum(line.qty_ordered * line.price_ordered for line in pricing.lines)
 
@@ -456,6 +547,7 @@ def prepare_invoice(
         invoice_num=invoice_num,
         total=total,
         blockers=blockers,
+        number_resolution=resolution,
     )
 
 

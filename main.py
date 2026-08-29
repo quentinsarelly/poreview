@@ -253,6 +253,9 @@ def _run_prepare_invoice(po_num: str, shipment_id: str, clients: workflow.Client
         print(f"Derived invoice number : {prep.invoice_num}")
         print(f"Derived invoice date   : {prep.invoice_date}  (Camelot ship date)")
         print(f"Total                  : {prep.total:,.2f}")
+        skipped = prep.number_resolution.skipped if prep.number_resolution else []
+        for entry in skipped:
+            print(f"Number collision       : {entry} -- skipped")
         check = prep.ship_date_check
         if check and check.spring_asn_date:
             print(f"Spring ASN cross-check : {check.spring_asn_raw} -> agrees")

@@ -11,9 +11,15 @@ Confirmed against the three invoices raised manually on 2026-08-21:
     PO 10001993952-3842, shipped 2026-08-18 -> TAR26081842
 
 The trailing 2 digits are the Target DC code (PO ...-3840 ships to TARGET DC
-3840). Two POs to the SAME DC shipping the SAME day would therefore collide --
-workflow.prepare_invoice checks Spring and Odoo for an existing invoice with
-the derived number rather than assuming uniqueness.
+3840), so two POs to the SAME DC shipping the SAME day derive the same number.
+That happens in practice -- seen 2026-08-27, POs 10002032881-3840 and
+10002009713-3840. workflow.resolve_invoice_num walks the candidates from
+invoice_num_candidates() and takes the first free in both Spring and Odoo,
+giving the second PO that day TAR26082740B.
+
+It checks whether *this* PO already owns a number before allocating a new one,
+which is what keeps re-runs safe: "take the next free number" on its own would
+hand a fresh suffix to an already-invoiced PO on every re-run.
 
 SHIP DATE: Camelot's ShipDate is authoritative. Spring has no ASN export
 endpoint, so its only ASN trace is po_last_asn_date -- the timestamp the ASN
@@ -32,6 +38,10 @@ from datetime import date, datetime
 # case the WMS is ever reconfigured -- anything else is rejected rather than
 # guessed at, since a misparsed date silently produces a wrong invoice number.
 _CAMELOT_DATE_FORMATS = ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d")
+
+# Suffixes for same-DC/same-day collisions. 'A' is omitted: the unsuffixed base
+# number is effectively A, so the first collision gets B.
+_COLLISION_SUFFIXES = "BCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 class DerivationError(Exception):
@@ -100,6 +110,20 @@ def check_ship_date(camelot_raw: str | None, spring_asn_raw: str | None) -> Ship
         spring_asn_raw=(spring_asn_raw or "").strip() or None,
         spring_asn_date=parse_spring_asn_date(spring_asn_raw),
     )
+
+
+def invoice_num_candidates(base: str) -> list[str]:
+    """The base number, then base+B, base+C ... for same-DC/same-day collisions.
+
+    Two POs to the same DC shipping the same day derive the same base number
+    (the trailing digits are the DC code, so they don't distinguish the POs).
+    Letters rather than "-2" so the number stays strictly alphanumeric: an EDI
+    810 invoice number lands in BIG02, and punctuation risks being rejected or
+    normalized by the retailer's validation.
+
+    'A' is skipped because the unsuffixed base already plays that role.
+    """
+    return [base] + [f"{base}{letter}" for letter in _COLLISION_SUFFIXES]
 
 
 def derive_invoice_num(po_num: str, ship_date: date) -> str:
