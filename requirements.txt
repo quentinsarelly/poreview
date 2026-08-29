@@ -1,7 +1,19 @@
-requests
-python-dotenv
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-google-api-python-client
-slack_bolt
+# Pinned to the versions this was developed and tested against. Railway builds
+# fresh from this file on every deploy, so anything unpinned would ship code
+# that was never actually run here. Bump deliberately, then re-run the checks
+# described in README "Testing without live API access".
+requests==2.34.2
+python-dotenv==1.2.2
+
+# Google Sheets price list. google-auth-oauthlib supplies the installed-app
+# consent flow used for local authorization; the deployed path only needs
+# google-auth to refresh the token from env vars.
+google-auth==2.56.2
+google-auth-oauthlib==1.4.0
+google-auth-httplib2==0.4.0
+google-api-python-client==2.198.0
+
+# Slack Socket Mode listener. slack_sdk is slack_bolt's runtime dependency and
+# is pinned too, so a compatible-range bump can't change it underneath us.
+slack_bolt==1.30.0
+slack_sdk==3.43.0
