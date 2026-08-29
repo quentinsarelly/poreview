@@ -34,18 +34,40 @@ invoice number and date, checks Spring and Odoo for an existing invoice, and
 
 ## Open questions
 
-- **Spring invoice creation: draft vs. send is unconfirmed.** `--create-invoice`
-  (see "Creating an invoice for a PO" below) POSTs to Spring's
-  `invoice-incoming/send/` endpoint. Nothing in Spring's docs says whether
-  that creates a draft or immediately transmits an EDI 810 invoice to the
-  retailer — it's the same style of endpoint used to create/acknowledge POs.
-  One hint (not proof): every real, already-sent Target invoice pulled via
-  `--list-invoices` shows `invoice_status=1`, while Spring's own generic docs
-  example returned `invoice_status=5` right after creating one via this same
-  API. **Resolve this — by asking Spring Systems support directly, or by
-  running one deliberate real test — before ever using `--create-invoice`
-  without `--dry-run`.** See the WARNING docstring on
+- **Spring invoicing is blocked on two things, and `SPRING_INVOICE_ENABLED`
+  stays off until both are resolved.** See
+  [docs/spring-api-permission-request.md](docs/spring-api-permission-request.md)
+  for the request sent to Spring Systems.
+
+  1. **Permission.** `POST invoice-incoming/send` returns
+     `405 Method Not Allowed` with `{"errors":["You do not have permission to
+     use this resource"]}` for API user `sarelly_odoo_prod_api`. It's an
+     authorization problem, not a routing one: the same URL with deliberately
+     bad credentials returns `401 Invalid API credentials`, so the route and
+     method are valid, and an `OPTIONS` probe returns the same 405 permission
+     error. Only Spring can fix this.
+  2. **Draft vs. send is unconfirmed.** Nothing in Spring's docs says whether
+     that call creates a draft or immediately transmits an EDI 810 to the
+     retailer. One hint (not proof): real already-sent Target invoices show
+     `invoice_status=1`, while Spring's own docs example shows
+     `invoice_status=5` — but the docs define no meaning for either value.
+
+  Until both land, `/po-invoice` runs every check and creates the Odoo draft,
+  reporting the Spring step as skipped; raise the Spring invoice manually in
+  the portal. When they land, set `SPRING_INVOICE_ENABLED=true` and redeploy —
+  no code change. See the WARNING docstring on
   `SpringSystemsClient.create_invoice`.
+
+- **Target's receipt of an invoice isn't visible via the API.** Spring's
+  invoice export carries `latest_transmission_send_date` (proof Spring sent
+  it) but exposes no 997 functional acknowledgment, rejection, or ack field
+  anywhere in the payload. Confirming Target actually accepted an invoice
+  means checking Spring's portal transmission log or Target's Partners Online.
+
+- **Google OAuth consent screen status is unverified.** If it's still in
+  "Testing", Google expires the refresh token after 7 days and the deployed
+  listener will start failing with no browser available to re-consent from.
+  Check APIs & Services → OAuth consent screen and publish it.
 
 ## Setup
 
