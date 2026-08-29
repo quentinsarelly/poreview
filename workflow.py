@@ -8,12 +8,14 @@ WorkflowError messages are written to be safe to show to an end user as-is
 (no credentials, no tracebacks) -- callers should render str(e) directly
 rather than reformatting it.
 
-Deliberately NOT done here: caching. load_price_map() re-reads the Google
-Sheet on every call, matching the current behavior; callers that evaluate
-several POs should load it once and pass it in. A TTL cache belongs with the
-rest of the headless hardening, not in this extraction.
+load_price_map() always re-reads the Google Sheet; Clients.price_map() is the
+cached accessor (PRICE_CACHE_SECONDS, default 300s) and is what long-lived
+callers should use. Callers evaluating many POs in one pass -- the batch run --
+still load once and pass the map in explicitly.
 """
 
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -120,6 +122,24 @@ class Clients:
     _spring: SpringSystemsClient | None = field(default=None, repr=False)
     _camelot: CamelotClient | None = field(default=None, repr=False)
     _odoo: OdooClient | None = field(default=None, repr=False)
+    _price_map: dict[str, float] | None = field(default=None, repr=False)
+    _price_map_loaded_at: float = field(default=0.0, repr=False)
+    _price_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def price_map(self) -> dict[str, float]:
+        """Price list, re-read at most once per PRICE_CACHE_SECONDS.
+
+        The listener handles commands on several threads and previously hit the
+        Sheets API once per command; the lock means a burst of commands triggers
+        one fetch rather than one each. A CLI run loads it at most once anyway,
+        so this only matters for the long-lived process.
+        """
+        with self._price_lock:
+            age = time.monotonic() - self._price_map_loaded_at
+            if self._price_map is None or age > self.config.price_cache_seconds:
+                self._price_map = load_price_map(self.config)
+                self._price_map_loaded_at = time.monotonic()
+            return self._price_map
 
     @property
     def spring(self) -> SpringSystemsClient:
@@ -378,7 +398,7 @@ def prepare_invoice(
     """
     po = fetch_po(clients, po_num)
     if price_map is None:
-        price_map = load_price_map(clients.config)
+        price_map = clients.price_map()
 
     pricing = review_pricing(po, price_map)
     shipment = check_shipment_quantities(clients, po, shipment_id)

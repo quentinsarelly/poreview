@@ -66,8 +66,10 @@ cp .env.example .env   # then fill in the values below
 | `SPRING_VENDOR_ID` | `--create-invoice` | Our own vendor `tp_id` in Spring (Sarelly's, not the retailer's) — `33145`, confirmed via a real PO's `<vendor_id>` field. |
 | `SPRING_INVOICE_ENABLED` | `/po-invoice`'s Spring leg | `1`/`true`/`yes`/`on` to enable; **off by default**. While off, `/po-invoice` runs every check and creates the Odoo draft but sends nothing to Spring or Target. See "Enabling the Spring leg". |
 | `GOOGLE_SHEET_ID` | always | The price list spreadsheet. |
-| `GOOGLE_CREDENTIALS_PATH` | always | OAuth "installed app" client secret (not a service-account key — service-account key export is blocked by org policy). |
-| `GOOGLE_TOKEN_PATH` | always | Where the cached OAuth token is stored after first login. |
+| `GOOGLE_CREDENTIALS_PATH` | local dev only | OAuth "installed app" client secret (not a service-account key — service-account key export is blocked by org policy). Only used for the one-time interactive consent; unset is fine when deployed. |
+| `GOOGLE_TOKEN_PATH` | local dev only | Where the cached OAuth token is stored after first login. |
+| `GOOGLE_REFRESH_TOKEN` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | deployed | Set these instead of the two above and no credential file is needed at all — see "Google auth when deployed". |
+| `PRICE_CACHE_SECONDS` | optional | How long the loaded price list is reused before re-reading the sheet. Default `300`. Only matters for the long-running listener. |
 | `PRICE_SHEET_WORKSHEET` / `PRICE_SHEET_SKU_COLUMN` / `PRICE_SHEET_PRICE_COLUMN` | always | Which tab/columns hold the SKU and expected price. |
 | `SLACK_WEBHOOK_URL` | `main.py` (non `--dry-run`) | Incoming webhook for posting batch summaries. |
 | `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | `slack_listener.py` | Bot (`xoxb-`) and app-level (`xapp-`) tokens for the Socket Mode listener (`/po-invoice`, `/po-review`, `/po-ship-check`). See below. |
@@ -256,6 +258,31 @@ python main.py --prepare-invoice 10001993952-3840 S0461276
 
 Runs steps 1–5 and prints the result, including any blockers. Read-only: it
 never creates an invoice. Exits `0` when ready to invoice, `1` when blocked.
+
+### Google auth when deployed
+
+The interactive OAuth consent flow needs a browser, so it can't run on a
+server. Instead of shipping a token file, set three env vars:
+
+```
+GOOGLE_REFRESH_TOKEN=   # copy from google-token.json after authorizing locally
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+```
+
+Credentials are then rebuilt in memory on each start and **nothing is written
+to disk** — a refresh token doesn't rotate when it's used (only the short-lived
+access token does), so there's no durable state and no persistent volume
+needed.
+
+Interactive consent only runs when stdin is a TTY. Headless it raises a clear
+error instead, because `run_local_server()` would otherwise block forever
+waiting for a browser visit that can never happen.
+
+> **Check the OAuth consent screen's publishing status before deploying.**
+> While it's in *Testing*, Google expires refresh tokens after **7 days**, which
+> would break the listener weekly with no way to re-consent from the server.
+> Publishing the consent screen removes that expiry.
 
 ## Setting up the Slack slash commands
 

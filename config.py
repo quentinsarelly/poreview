@@ -26,6 +26,9 @@ class Config:
     price_sheet_worksheet: str
     price_sheet_sku_column: str
     price_sheet_price_column: str
+    # How long a loaded price list is reused before re-reading the sheet. Only
+    # meaningful in the long-lived listener; a CLI run loads it at most once.
+    price_cache_seconds: int
 
     # Optional: only needed when actually posting to Slack (not for --dry-run).
     slack_webhook_url: str | None
@@ -61,13 +64,16 @@ class Config:
             spring_vendor_id=os.getenv("SPRING_VENDOR_ID"),
             spring_invoice_enabled=_flag("SPRING_INVOICE_ENABLED"),
             google_sheet_id=_require("GOOGLE_SHEET_ID"),
-            google_credentials_path=_require("GOOGLE_CREDENTIALS_PATH"),
+            google_credentials_path=os.getenv(
+                "GOOGLE_CREDENTIALS_PATH", "./google-credentials.json"
+            ),
             google_token_path=os.getenv("GOOGLE_TOKEN_PATH", "./google-token.json"),
             price_sheet_worksheet=os.getenv("PRICE_SHEET_WORKSHEET", "Sheet1"),
             price_sheet_sku_column=os.getenv("PRICE_SHEET_SKU_COLUMN", "sku"),
             price_sheet_price_column=os.getenv(
                 "PRICE_SHEET_PRICE_COLUMN", "expected_unit_price"
             ),
+            price_cache_seconds=_int("PRICE_CACHE_SECONDS", 300),
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL") or None,
             slack_bot_token=os.getenv("SLACK_BOT_TOKEN") or None,
             slack_app_token=os.getenv("SLACK_APP_TOKEN") or None,
@@ -85,6 +91,16 @@ class Config:
             odoo_journal_id=os.getenv("ODOO_JOURNAL_ID") or None,
             odoo_target_partner_id=os.getenv("ODOO_TARGET_PARTNER_ID") or None,
         )
+
+
+def _int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from e
 
 
 def _flag(name: str) -> bool:
