@@ -364,7 +364,9 @@ it here.
 | `slack_notify.py` | Formats `POResult`/`ShipmentResult`/`InvoicePreparation` into Slack text and Block Kit, and posts via webhook. |
 | `state.py` | Tracks which PO IDs have already been posted (`processed_pos.json`), used only by the batch CLI. |
 | `config.py` | Loads and validates all `.env` settings. |
-| `deploy/` | systemd unit template for running the Slack listener as a service. |
+| `Procfile` | Start command for the deploy (`worker: python slack_listener.py`). Without it the Python builder defaults to `python main.py`, which would run the *batch review* instead of the listener. |
+| `.python-version` | Pins the Python version used to build the deploy (3.12, matching local). |
+| `deploy/` | systemd unit template, from when the listener ran on a local machine. Superseded by the Procfile-based deploy. |
 
 ## Testing without live API access
 
