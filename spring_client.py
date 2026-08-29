@@ -163,6 +163,11 @@ def _parse_po_element(po_el: ElementTree.Element) -> dict[str, Any]:
         "po_id": _text(po_el, "po_id"),
         "po_num": _text(po_el, "po_num"),
         "po_acknowledge_status": _text(po_el, "po_acknowledge_status"),
+        # Timestamp the ASN was transmitted ("2026-08-18 18:13:25"), not a declared
+        # ship date -- Spring exposes no ASN export endpoint (asn-outgoing,
+        # shipment-outgoing etc. all 404). Used only to cross-check Camelot's
+        # ship_date, never as the primary source. See invoicing.py.
+        "po_last_asn_date": _text(po_el, "po_last_asn_date"),
         "retailer_id": _text(po_el, "retailer_id"),
         "retailer": {"retailer_name": _text(retailer_el, "tp_name")},
         "po_items": {"po_item": items},

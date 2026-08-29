@@ -15,6 +15,10 @@ class Config:
     spring_retailer_id: str | None
     # Optional: only needed for --create-invoice (our own vendor tp_id in Spring).
     spring_vendor_id: str | None
+    # Gates the Spring leg of /po-invoice. Off until Spring grants the API user
+    # permission for invoice-incoming/send AND confirms whether that call creates
+    # a draft or immediately transmits an EDI 810 to Target.
+    spring_invoice_enabled: bool
 
     google_sheet_id: str
     google_credentials_path: str
@@ -55,6 +59,7 @@ class Config:
             spring_api_key=os.getenv("SPRING_API_KEY"),
             spring_retailer_id=os.getenv("SPRING_RETAILER_ID"),
             spring_vendor_id=os.getenv("SPRING_VENDOR_ID"),
+            spring_invoice_enabled=_flag("SPRING_INVOICE_ENABLED"),
             google_sheet_id=_require("GOOGLE_SHEET_ID"),
             google_credentials_path=_require("GOOGLE_CREDENTIALS_PATH"),
             google_token_path=os.getenv("GOOGLE_TOKEN_PATH", "./google-token.json"),
@@ -80,6 +85,10 @@ class Config:
             odoo_journal_id=os.getenv("ODOO_JOURNAL_ID") or None,
             odoo_target_partner_id=os.getenv("ODOO_TARGET_PARTNER_ID") or None,
         )
+
+
+def _flag(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _require(name: str) -> str:

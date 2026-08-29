@@ -25,6 +25,11 @@ Usage:
     # SpringSystemsClient.create_invoice before ever running this for real.
     python main.py --create-invoice 10001964460-3841 TAR26081342 --invoice-date 2026-08-14 --dry-run
 
+    # Read-only preview of the full /po-invoice flow: both checks, the derived
+    # invoice number and date, and any blockers. Never creates anything --
+    # confirming and creating is done from the Slack button.
+    python main.py --prepare-invoice 10001993952-3840 S0461276
+
     # List invoices created on/after a date (default: today) -- replaces the
     # manual "export today's invoices" step in Spring's UI.
     python main.py --list-invoices
@@ -114,6 +119,15 @@ def parse_args() -> argparse.Namespace:
         "a PO's line items, e.g. --push-odoo-invoice 10001964460-3841 TAR26081342. "
         "Independent of Spring's --create-invoice. With --dry-run, prints what would be "
         "created without touching Odoo.",
+    )
+    parser.add_argument(
+        "--prepare-invoice",
+        nargs=2,
+        metavar=("PO_NUM", "SHIPMENT_ID"),
+        help="Run everything /po-invoice runs -- price check, shipment check, invoice "
+        "number/date derivation, duplicate checks -- and print the result, e.g. "
+        "--prepare-invoice 10001993952-3840 S0461276. Read-only: this never creates "
+        "an invoice. Confirming and creating is done from the Slack button.",
     )
     parser.add_argument(
         "--list-invoices",
@@ -226,6 +240,35 @@ def _run_push_odoo_invoice(
     return 0
 
 
+def _run_prepare_invoice(po_num: str, shipment_id: str, clients: workflow.Clients) -> int:
+    """Read-only preview of what /po-invoice would offer. Never invoices."""
+    workflow.require_camelot_env(clients.config, _ENV_HINT)
+    prep = workflow.prepare_invoice(clients, po_num, shipment_id)
+
+    print(format_summary(prep.pricing))
+    print()
+    print(format_shipment_summary(prep.shipment))
+    print()
+    if prep.invoice_num and prep.ship_date:
+        print(f"Derived invoice number : {prep.invoice_num}")
+        print(f"Derived invoice date   : {prep.invoice_date}  (Camelot ship date)")
+        print(f"Total                  : {prep.total:,.2f}")
+        check = prep.ship_date_check
+        if check and check.spring_asn_date:
+            print(f"Spring ASN cross-check : {check.spring_asn_raw} -> agrees")
+        else:
+            print("Spring ASN cross-check : no ASN date on the PO, Camelot used alone")
+        print()
+
+    if prep.ready:
+        print("READY -- /po-invoice would offer the confirm button.")
+        return 0
+    print("NOT READY -- blocking:")
+    for blocker in prep.blockers:
+        print(f"  - {blocker}")
+    return 1
+
+
 def _run_batch_review(clients: workflow.Clients, args: argparse.Namespace) -> int:
     config = clients.config
     if args.from_csv:
@@ -282,6 +325,10 @@ def _dispatch(args: argparse.Namespace, clients: workflow.Clients) -> int:
     if args.push_odoo_invoice:
         po_num, invoice_num = args.push_odoo_invoice
         return _run_push_odoo_invoice(po_num, invoice_num, clients, args)
+
+    if args.prepare_invoice:
+        po_num, shipment_id = args.prepare_invoice
+        return _run_prepare_invoice(po_num, shipment_id, clients)
 
     if args.list_invoices:
         return _run_list_invoices(args.list_invoices, clients)

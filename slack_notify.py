@@ -1,9 +1,13 @@
+import json
 import time
 
 import requests
 
 from compare import LineStatus, POResult, POStatus
 from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
+
+# action_id of the /po-invoice confirmation button, shared with slack_listener.
+INVOICE_CONFIRM_ACTION = "po_invoice_confirm"
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2
@@ -100,6 +104,120 @@ def format_shipment_summary(result: ShipmentResult) -> str:
             )
         else:
             lines.append(f"{emoji} SKU `{line.sku}` — qty {line.qty_shipped:g}")
+    return "\n".join(lines)
+
+
+def _section(text: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
+def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
+    """Renders a workflow.InvoicePreparation as (fallback_text, blocks).
+
+    The confirm button is only attached when nothing is blocking. Its value
+    carries the derived number and date, but the handler re-derives them from
+    scratch rather than trusting the payload -- see slack_listener.
+    """
+    ready = prep.ready
+    header = (
+        f":white_check_mark: *PO {prep.po_num}* passed all checks — ready to invoice"
+        if ready
+        else f":rotating_light: *PO {prep.po_num}* is not ready to invoice"
+    )
+    blocks = [
+        _section(header),
+        _section(format_summary(prep.pricing)),
+        _section(format_shipment_summary(prep.shipment)),
+    ]
+
+    if prep.invoice_num and prep.ship_date:
+        detail = [
+            f"*Invoice number* `{prep.invoice_num}`  _(derived)_",
+            f"*Invoice date* `{prep.invoice_date}`  _(Camelot ship date)_",
+            f"*Total* {prep.total:,.2f}",
+        ]
+        check = prep.ship_date_check
+        if check and check.spring_asn_date:
+            detail.append(
+                f"_Ship date cross-checked against Spring's ASN "
+                f"({check.spring_asn_raw}) — agrees._"
+            )
+        else:
+            detail.append(
+                "_Spring has no ASN date to cross-check against; using Camelot's "
+                "ship date alone._"
+            )
+        blocks.append(_section("\n".join(detail)))
+
+    if prep.blockers:
+        blocks.append(
+            _section(
+                "*Blocking:*\n" + "\n".join(f"• {b}" for b in prep.blockers)
+            )
+        )
+
+    if ready:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": INVOICE_CONFIRM_ACTION,
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": "Create invoices"},
+                        "value": json.dumps(
+                            {
+                                "po_num": prep.po_num,
+                                "shipment_id": prep.shipment_id,
+                                "invoice_num": prep.invoice_num,
+                                "invoice_date": prep.invoice_date,
+                            }
+                        ),
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Create invoices?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"Creates a draft invoice in Odoo for *{prep.po_num}* "
+                                    f"as `{prep.invoice_num}` dated `{prep.invoice_date}`, "
+                                    "and submits it to Spring if that leg is enabled. "
+                                    "The Spring step may transmit an EDI 810 to Target "
+                                    "and cannot be undone."
+                                ),
+                            },
+                            "confirm": {"type": "plain_text", "text": "Create"},
+                            "deny": {"type": "plain_text", "text": "Cancel"},
+                        },
+                    }
+                ],
+            }
+        )
+
+    fallback = f"PO {prep.po_num} — {'ready to invoice' if ready else 'not ready to invoice'}"
+    return fallback, blocks
+
+
+def format_invoicing_outcome(outcome) -> str:
+    """Renders a workflow.InvoicingOutcome."""
+    lines = [
+        f":white_check_mark: *{outcome.invoice_num}* dated `{outcome.invoice_date}`",
+        f":page_facing_up: Odoo DRAFT invoice created (account.move `{outcome.odoo_move_id}`) "
+        "— not posted, review and post it in Odoo.",
+    ]
+    if outcome.spring_skipped:
+        lines.append(f":pause_button: Spring skipped — {outcome.spring_skipped}")
+    elif outcome.spring_error:
+        lines.append(
+            f":rotating_light: Spring invoice FAILED — {outcome.spring_error}\n"
+            "The Odoo draft above was still created; the Spring invoice was not."
+        )
+    elif outcome.spring_result:
+        result = outcome.spring_result
+        lines.append(
+            f":outbox_tray: Spring invoice created — id `{result.get('invoice_id')}`, "
+            f"status `{result.get('invoice_status')}`, amount {result.get('invoice_amount')}"
+        )
     return "\n".join(lines)
 
 

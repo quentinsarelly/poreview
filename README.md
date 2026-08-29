@@ -26,6 +26,12 @@ Two checks, each runnable two ways:
   show up. Until that's resolved (or Camelot confirms the right call), find
   the shipment ID manually in Camelot's UI.
 
+**Both checks plus invoicing, in one command:** `/po-invoice <po_num>
+<shipment_id>` runs the pricing check and the shipment check, derives the
+invoice number and date, checks Spring and Odoo for an existing invoice, and
+— only if everything passes — offers a button that creates the invoices. See
+"Invoicing a PO from Slack" below.
+
 ## Open questions
 
 - **Spring invoice creation: draft vs. send is unconfirmed.** `--create-invoice`
@@ -58,17 +64,18 @@ cp .env.example .env   # then fill in the values below
 | `SPRING_API_USER` / `SPRING_API_KEY` | live API pulls | Production Spring Systems API credentials. |
 | `SPRING_RETAILER_ID` | live API pulls | The retailer's Spring `tp_id`, **not** your own vendor/company name. Target's is `135`. Spring's sandbox/demo data lives under `699` — don't confuse the two. |
 | `SPRING_VENDOR_ID` | `--create-invoice` | Our own vendor `tp_id` in Spring (Sarelly's, not the retailer's) — `33145`, confirmed via a real PO's `<vendor_id>` field. |
+| `SPRING_INVOICE_ENABLED` | `/po-invoice`'s Spring leg | `1`/`true`/`yes`/`on` to enable; **off by default**. While off, `/po-invoice` runs every check and creates the Odoo draft but sends nothing to Spring or Target. See "Enabling the Spring leg". |
 | `GOOGLE_SHEET_ID` | always | The price list spreadsheet. |
 | `GOOGLE_CREDENTIALS_PATH` | always | OAuth "installed app" client secret (not a service-account key — service-account key export is blocked by org policy). |
 | `GOOGLE_TOKEN_PATH` | always | Where the cached OAuth token is stored after first login. |
 | `PRICE_SHEET_WORKSHEET` / `PRICE_SHEET_SKU_COLUMN` / `PRICE_SHEET_PRICE_COLUMN` | always | Which tab/columns hold the SKU and expected price. |
 | `SLACK_WEBHOOK_URL` | `main.py` (non `--dry-run`) | Incoming webhook for posting batch summaries. |
-| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | `slack_listener.py` | Bot (`xoxb-`) and app-level (`xapp-`) tokens for the `/po-review`/`/po-ship-check` Socket Mode listener. See below. |
+| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | `slack_listener.py` | Bot (`xoxb-`) and app-level (`xapp-`) tokens for the Socket Mode listener (`/po-invoice`, `/po-review`, `/po-ship-check`). See below. |
 | `CAMELOT_SOAP_URL` / `CAMELOT_USERNAME` / `CAMELOT_PASSWORD` | shipment-quantity checks | Camelot 3PL (Excalibur) SOAP credentials. |
 | `CAMELOT_CLIENT` / `CAMELOT_TRADING_PARTNER` | shipment-quantity checks | Excalibur client/trading-partner codes for the account. |
 | `CAMELOT_SHIPMENT_PROFILE` | shipment-quantity checks | The Excalibur **interface profile** bound to the Shipment Export XMLPort (`SAR_SHP_E` on this account) — Camelot's `pInterfaceProfile` determines which data shape a call returns, not the SOAP action name, so the inventory-only profile used by other Sarelly repos (`SAR_ITEM_E`) will not work here. |
-| `ODOO_DB_URL` / `ODOO_DB_NAME` / `ODOO_USER` / `ODOO_API_KEY` | `--push-odoo-invoice` | `ODOO_API_KEY` must be a dedicated API key (avatar → My Profile → Account Security → New API Key, set to **Persistent**), not your login password — Odoo Online blocks password auth on the external API. |
-| `ODOO_COMPANY_ID` / `ODOO_JOURNAL_ID` / `ODOO_TARGET_PARTNER_ID` | `--push-odoo-invoice` | Fixed IDs for Target invoices in this Odoo instance — `2` (SARELLY USA LLC), `33` (Sales/INV journal), `7642` (Target Stores, Inc.) — confirmed by inspecting a real existing Target invoice. |
+| `ODOO_DB_URL` / `ODOO_DB_NAME` / `ODOO_USER` / `ODOO_API_KEY` | `--push-odoo-invoice`, `/po-invoice` | `ODOO_API_KEY` must be a dedicated API key (avatar → My Profile → Account Security → New API Key, set to **Persistent**), not your login password — Odoo Online blocks password auth on the external API. |
+| `ODOO_COMPANY_ID` / `ODOO_JOURNAL_ID` / `ODOO_TARGET_PARTNER_ID` | `--push-odoo-invoice`, `/po-invoice` | Fixed IDs for Target invoices in this Odoo instance — `2` (SARELLY USA LLC), `33` (Sales/INV journal), `7642` (Target Stores, Inc.) — confirmed by inspecting a real existing Target invoice. |
 
 The Spring/price-list SKU join key is `product.product_vendor_item_num` (our
 own SKU) — **not** `po_item_buyer_item_num` (the retailer's internal item
@@ -184,6 +191,72 @@ If a SKU on the PO doesn't have a matching Odoo product (`default_code`
 exact match), the whole push aborts before creating anything — fix the
 product record in Odoo first rather than push a partial invoice.
 
+## Invoicing a PO from Slack
+
+```
+/po-invoice 10001993952-3840 S0461276
+```
+
+Runs the whole flow and stops at the first thing that isn't right:
+
+1. **Pricing check** — must be `ALL_MATCH`.
+2. **Shipment quantity check** — must be `ALL_MATCH`.
+3. **Ship date** — taken from Camelot's `ShipDate`, and cross-checked against
+   Spring's `po_last_asn_date`. If the two disagree the run stops; see below.
+4. **Invoice number** — derived as `TAR` + `YYMMDD` (ship date) + the PO's
+   trailing 2 digits (its Target DC code). PO `10001993952-3840` shipped
+   `2026-08-18` → `TAR26081840`.
+5. **Duplicate check** — Spring and Odoo are both searched for that invoice
+   number, since two POs to the same DC shipping the same day would otherwise
+   derive the same one.
+
+If anything blocks, Slack shows every blocker at once and no button. If
+everything passes, it posts the derived invoice number, date and total with a
+**Create invoices** button (behind a confirmation dialog).
+
+Clicking it **re-runs all of the above from scratch** rather than trusting the
+button's payload — the PO, shipment or price list may have changed since the
+check, and the click may be hours old. If anything has drifted, nothing is
+invoiced and Slack says what changed. The original message is replaced the
+moment the button is clicked, so a double-click can't invoice twice.
+
+Then it creates the **Odoo draft invoice first** (reversible), and only then
+the Spring invoice (which may transmit an EDI 810 to Target, and is not).
+If Odoo fails, Spring is never called.
+
+### The ship-date cross-check
+
+Camelot's ship date is authoritative. Spring has no ASN export endpoint
+(`asn-outgoing`, `shipment-outgoing` etc. all 404), so its only ASN trace is
+`po_last_asn_date` — the timestamp the ASN was *transmitted*, which is not the
+same as the date the goods shipped. An ASN sent after midnight, or stamped in
+a different timezone, would be off by a day.
+
+That matters because this one date sets **both** the invoice date and the
+invoice number, and the invoice number is what Target reconciles against. So a
+disagreement between the two sources is a hard stop, not a warning.
+
+### Enabling the Spring leg
+
+`SPRING_INVOICE_ENABLED` is off by default, and while it's off `/po-invoice`
+runs every check and creates the Odoo draft but does **not** send anything to
+Spring or Target — it reports the Spring step as skipped.
+
+Turn it on only once Spring Systems has:
+1. granted this API user permission for `invoice-incoming/send` (it currently
+   returns `405 "You do not have permission to use this resource"`), and
+2. confirmed whether that call creates a draft or immediately transmits an
+   EDI 810 to Target.
+
+### Previewing from the CLI
+
+```bash
+python main.py --prepare-invoice 10001993952-3840 S0461276
+```
+
+Runs steps 1–5 and prints the result, including any blockers. Read-only: it
+never creates an invoice. Exits `0` when ready to invoice, `1` when blocked.
+
 ## Setting up the Slack slash commands
 
 The listener uses Slack **Socket Mode**, so it needs no public URL or ngrok
@@ -197,9 +270,12 @@ tunnel — it opens an outbound websocket connection to Slack.
 3. **OAuth & Permissions** → add bot token scopes `commands` and
    `chat:write` → install (or reinstall) the app to your workspace. Copy the
    **Bot User OAuth Token** (`xoxb-...`) into `.env` as `SLACK_BOT_TOKEN`.
-4. **Slash Commands** → create `/po-review` and `/po-ship-check`. The Request
-   URL field can be left blank/placeholder for both — Socket Mode doesn't
-   call it.
+4. **Slash Commands** → create `/po-invoice`, `/po-review` and
+   `/po-ship-check`. The Request URL field can be left blank/placeholder for
+   all of them — Socket Mode doesn't call it.
+   **Interactivity & Shortcuts** → toggle **Interactivity** on (the Request
+   URL there can also be left blank under Socket Mode). Without this the
+   `/po-invoice` confirm button does nothing when clicked.
 5. Invite the bot to the channel where you want to use these commands.
 6. Run it:
    ```bash
@@ -248,15 +324,17 @@ it here.
 
 | File | Purpose |
 |---|---|
-| `main.py` | Batch CLI entry point; also the `--check-shipment` one-off shipment check. |
-| `slack_listener.py` | `/po-review` and `/po-ship-check` Socket Mode listener. |
+| `main.py` | CLI adapter over `workflow.py`: batch review, one-off checks, `--prepare-invoice`. |
+| `slack_listener.py` | Slack adapter over `workflow.py`: `/po-invoice`, `/po-review`, `/po-ship-check`. |
+| `workflow.py` | Shared business logic both entry points call. Returns values or raises `WorkflowError`; never prints or exits. |
+| `invoicing.py` | Pure derivation rules for the invoice number and invoice date, plus the Camelot/Spring ship-date cross-check. |
 | `spring_client.py` | Spring Systems API client (XML responses, header-based pagination). |
 | `camelot_client.py` | Camelot 3PL (Excalibur SOAP) client for shipment quantity lookups. |
 | `csv_po.py` | Loads Spring's flattened CSV export format, for testing without API access. |
 | `price_list.py` | Loads/parses the Google Sheets price list (OAuth). |
 | `compare.py` | Core price-comparison logic (`evaluate_po`, `POStatus`/`LineStatus`). |
 | `compare_shipment.py` | Shipment quantity-comparison logic (`evaluate_shipment`, `ShipmentStatus`/`ShipmentLineStatus`). |
-| `slack_notify.py` | Formats `POResult`/`ShipmentResult` into Slack message text and posts via webhook. |
+| `slack_notify.py` | Formats `POResult`/`ShipmentResult`/`InvoicePreparation` into Slack text and Block Kit, and posts via webhook. |
 | `state.py` | Tracks which PO IDs have already been posted (`processed_pos.json`), used only by the batch CLI. |
 | `config.py` | Loads and validates all `.env` settings. |
 | `deploy/` | systemd unit template for running the Slack listener as a service. |

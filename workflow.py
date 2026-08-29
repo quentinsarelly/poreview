@@ -15,14 +15,16 @@ rest of the headless hardening, not in this extraction.
 """
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 from xml.etree import ElementTree
 
 import csv_po
+import invoicing
 import price_list
-from camelot_client import CamelotClient
-from compare import POResult, evaluate_po
-from compare_shipment import ShipmentResult, evaluate_shipment
+from camelot_client import CamelotClient, CamelotError
+from compare import POResult, POStatus, evaluate_po
+from compare_shipment import ShipmentResult, ShipmentStatus, evaluate_shipment
 from config import Config
 from odoo_client import OdooClient
 from spring_client import SpringSystemsClient, build_invoice_request_xml, get_line_items
@@ -196,7 +198,13 @@ def review_pricing(po: dict[str, Any], price_map: dict[str, float]) -> POResult:
 def check_shipment_quantities(
     clients: Clients, po: dict[str, Any], shipment_id: str
 ) -> ShipmentResult:
-    shipment = clients.camelot.get_shipment_detail(shipment_id)
+    try:
+        shipment = clients.camelot.get_shipment_detail(shipment_id)
+    except CamelotError as e:
+        # Usually a shipment ID that doesn't exist ("Document S9999999 not
+        # found."), which is a typo in the Slack command, not a bug -- report it
+        # as a message instead of a traceback.
+        raise WorkflowError(f"Camelot rejected shipment ID {shipment_id!r}: {e}") from e
     return evaluate_shipment(po, shipment)
 
 
@@ -316,3 +324,163 @@ def send_spring_invoice(
 
 def list_invoices_since(clients: Clients, date_str: str) -> list[dict[str, Any]]:
     return clients.spring.get_invoices_created_since(date_str)
+
+
+def find_spring_invoice(clients: Clients, invoice_num: str) -> dict[str, Any] | None:
+    matches = clients.spring.get_invoices("invoice_num", "eq", invoice_num)
+    return matches[0] if matches else None
+
+
+# --- /po-invoice: check everything, then derive ---------------------------
+
+
+@dataclass
+class InvoicePreparation:
+    """The full result of checking a PO+shipment: what was verified, what it
+    would invoice as, and everything standing in the way. Never invoices
+    anything itself -- execute_invoicing() does that, only once ready."""
+
+    po: dict[str, Any]
+    po_num: str
+    shipment_id: str
+    pricing: POResult
+    shipment: ShipmentResult
+    ship_date_check: invoicing.ShipDateCheck | None
+    invoice_num: str | None
+    total: float
+    blockers: list[str]
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+    @property
+    def ship_date(self) -> date | None:
+        return self.ship_date_check.ship_date if self.ship_date_check else None
+
+    @property
+    def invoice_date(self) -> str | None:
+        ship_date = self.ship_date
+        return ship_date.isoformat() if ship_date else None
+
+
+def prepare_invoice(
+    clients: Clients,
+    po_num: str,
+    shipment_id: str,
+    *,
+    price_map: dict[str, float] | None = None,
+) -> InvoicePreparation:
+    """Price check + shipment check + date/number derivation + duplicate checks.
+
+    Read-only: every blocker is collected rather than raised on the first
+    failure, so one Slack message can show everything that needs fixing.
+    """
+    po = fetch_po(clients, po_num)
+    if price_map is None:
+        price_map = load_price_map(clients.config)
+
+    pricing = review_pricing(po, price_map)
+    shipment = check_shipment_quantities(clients, po, shipment_id)
+
+    blockers: list[str] = []
+    if pricing.status != POStatus.ALL_MATCH:
+        blockers.append(f"Pricing check is {pricing.status.value}, not ALL_MATCH.")
+    if shipment.status != ShipmentStatus.ALL_MATCH:
+        blockers.append(f"Shipment check is {shipment.status.value}, not ALL_MATCH.")
+
+    ship_date_check: invoicing.ShipDateCheck | None = None
+    invoice_num: str | None = None
+    try:
+        ship_date_check = invoicing.check_ship_date(
+            shipment.ship_date, po.get("po_last_asn_date")
+        )
+        if ship_date_check.agrees:
+            invoice_num = invoicing.derive_invoice_num(po_num, ship_date_check.ship_date)
+        else:
+            blockers.append(
+                f"Ship date sources disagree -- {ship_date_check.disagreement}. "
+                "Resolve which is right before invoicing: this date sets both the "
+                "invoice date and the invoice number."
+            )
+    except invoicing.DerivationError as e:
+        blockers.append(str(e))
+
+    if invoice_num:
+        existing = find_spring_invoice(clients, invoice_num)
+        if existing:
+            blockers.append(
+                f"Spring already has invoice {invoice_num} "
+                f"(id={existing.get('invoice_id')}, created {existing.get('invoice_created')})."
+            )
+        try:
+            require_odoo_env(clients.config)
+            existing_move = clients.odoo.find_invoice_by_reference(invoice_num)
+            if existing_move:
+                blockers.append(
+                    f"Odoo already has an invoice with reference {invoice_num} "
+                    f"(account.move id={existing_move})."
+                )
+        except WorkflowError as e:
+            blockers.append(str(e))
+
+    total = sum(line.qty_ordered * line.price_ordered for line in pricing.lines)
+
+    return InvoicePreparation(
+        po=po,
+        po_num=po_num,
+        shipment_id=shipment_id,
+        pricing=pricing,
+        shipment=shipment,
+        ship_date_check=ship_date_check,
+        invoice_num=invoice_num,
+        total=total,
+        blockers=blockers,
+    )
+
+
+@dataclass
+class InvoicingOutcome:
+    invoice_num: str
+    invoice_date: str
+    odoo_move_id: int
+    spring_result: dict[str, Any] | None = None
+    spring_error: str | None = None
+    spring_skipped: str | None = None
+
+
+def execute_invoicing(clients: Clients, prep: InvoicePreparation) -> InvoicingOutcome:
+    """Create the Odoo draft, then (if enabled) the Spring invoice.
+
+    Odoo first on purpose: the draft is reversible and the Spring call may
+    transmit an EDI 810 to Target, which is not. If Odoo fails this raises
+    before Spring is touched. A Spring failure is captured rather than raised,
+    so the caller can still report the Odoo draft that did get created.
+    """
+    if not prep.ready:
+        raise WorkflowError(
+            f"PO {prep.po_num} is not ready to invoice: {' '.join(prep.blockers)}"
+        )
+
+    plan = plan_odoo_invoice(clients, prep.po, prep.invoice_num, prep.invoice_date)
+    move_id = create_odoo_invoice(clients, plan)
+
+    outcome = InvoicingOutcome(
+        invoice_num=prep.invoice_num,
+        invoice_date=prep.invoice_date,
+        odoo_move_id=move_id,
+    )
+
+    if not clients.config.spring_invoice_enabled:
+        outcome.spring_skipped = (
+            "SPRING_INVOICE_ENABLED is off -- no invoice was sent to Spring/Target."
+        )
+        return outcome
+
+    try:
+        outcome.spring_result = send_spring_invoice(
+            clients, prep.po, prep.invoice_num, prep.invoice_date
+        )
+    except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
+        outcome.spring_error = f"{type(e).__name__}: {e}"
+    return outcome

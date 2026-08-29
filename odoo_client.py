@@ -49,6 +49,19 @@ class OdooClient:
         ids = self.execute("product.product", "search", [["default_code", "=", sku]], limit=1)
         return ids[0] if ids else None
 
+    def find_invoice_by_reference(self, invoice_num: str) -> int | None:
+        """Existing customer invoice carrying this invoice number, in any state
+        (draft included). Guards against a double-click on the Slack confirm
+        button creating two drafts for the same shipment -- Odoo has no
+        uniqueness constraint on payment_reference of its own."""
+        ids = self.execute(
+            "account.move",
+            "search",
+            [["payment_reference", "=", invoice_num], ["move_type", "=", "out_invoice"]],
+            limit=1,
+        )
+        return ids[0] if ids else None
+
     def create_draft_invoice(
         self,
         *,
