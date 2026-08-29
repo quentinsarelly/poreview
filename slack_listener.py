@@ -31,6 +31,8 @@ Usage:
 """
 
 import json
+import logging
+import os
 import sys
 import threading
 import traceback
@@ -67,7 +69,20 @@ def _in_background(label: str, fn) -> None:
     threading.Thread(target=runner, name=label, daemon=True).start()
 
 
+def _configure_logging() -> None:
+    """Without this, Bolt's logging goes nowhere and a deployed listener
+    produces an empty log -- including the 'session established' line that is
+    the only confirmation the websocket actually connected. Unbuffered stdout
+    so lines appear in `railway logs` as they happen rather than in blocks."""
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+
 def main() -> int:
+    _configure_logging()
     config = Config.load()
     try:
         workflow.require_listener_env(config, "Set them in .env.")
