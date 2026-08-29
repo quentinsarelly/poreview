@@ -13,6 +13,9 @@ see camelot_client.py).
 Both are ad hoc, on-demand checks: neither touches processed_pos.json, so
 neither affects (or is affected by) the batch "new POs" flow in main.py.
 
+This is the Slack adapter over workflow.py -- it parses command text and
+renders results, while the Spring / Camelot logic is shared with main.py.
+
 Usage:
     python slack_listener.py
 """
@@ -22,56 +25,20 @@ import sys
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-import price_list
-from camelot_client import CamelotClient
-from compare import evaluate_po
-from compare_shipment import evaluate_shipment
+import workflow
 from config import Config
 from slack_notify import format_shipment_summary, format_summary
-from spring_client import SpringSystemsClient
 
 
 def main() -> int:
     config = Config.load()
-
-    missing = [
-        name
-        for name, value in [
-            ("SPRING_API_BASE_URL", config.spring_base_url),
-            ("SPRING_API_USER", config.spring_api_user),
-            ("SPRING_API_KEY", config.spring_api_key),
-            ("SLACK_BOT_TOKEN", config.slack_bot_token),
-            ("SLACK_APP_TOKEN", config.slack_app_token),
-            ("CAMELOT_SOAP_URL", config.camelot_soap_url),
-            ("CAMELOT_USERNAME", config.camelot_username),
-            ("CAMELOT_PASSWORD", config.camelot_password),
-            ("CAMELOT_CLIENT", config.camelot_client_code),
-            ("CAMELOT_TRADING_PARTNER", config.camelot_trading_partner),
-            ("CAMELOT_SHIPMENT_PROFILE", config.camelot_shipment_profile),
-        ]
-        if not value
-    ]
-    if missing:
-        print(
-            f"Missing required environment variable(s): {', '.join(missing)}. "
-            "Set them in .env.",
-            file=sys.stderr,
-        )
+    try:
+        workflow.require_listener_env(config, "Set them in .env.")
+    except workflow.WorkflowError as e:
+        print(str(e), file=sys.stderr)
         return 1
 
-    spring_client = SpringSystemsClient(
-        base_url=config.spring_base_url,
-        api_user=config.spring_api_user,
-        api_key=config.spring_api_key,
-    )
-    camelot_client = CamelotClient(
-        soap_url=config.camelot_soap_url,
-        username=config.camelot_username,
-        password=config.camelot_password,
-        client_code=config.camelot_client_code,
-        trading_partner=config.camelot_trading_partner,
-        shipment_profile=config.camelot_shipment_profile,
-    )
+    clients = workflow.Clients(config)
     app = App(token=config.slack_bot_token)
 
     @app.command("/po-review")
@@ -83,21 +50,11 @@ def main() -> int:
             return
 
         try:
-            po = spring_client.get_po_by_num(po_num)
-            if po is None:
-                say(f":question: PO `{po_num}` not found.")
-                return
-
-            price_map = price_list.load_prices(
-                sheet_id=config.google_sheet_id,
-                credentials_path=config.google_credentials_path,
-                token_path=config.google_token_path,
-                worksheet_name=config.price_sheet_worksheet,
-                sku_column=config.price_sheet_sku_column,
-                price_column=config.price_sheet_price_column,
-            )
-            result = evaluate_po(po, price_map)
-            say(format_summary(result))
+            po = workflow.fetch_po(clients, po_num)
+            price_map = workflow.load_price_map(config)
+            say(format_summary(workflow.review_pricing(po, price_map)))
+        except workflow.PONotFound:
+            say(f":question: PO `{po_num}` not found.")
         except Exception as e:
             print(f"Error handling /po-review {po_num!r}: {e}", file=sys.stderr)
             say(f":rotating_light: Error reviewing PO `{po_num}`: {e}")
@@ -116,14 +73,11 @@ def main() -> int:
         po_num, shipment_id = parts
 
         try:
-            po = spring_client.get_po_by_num(po_num)
-            if po is None:
-                say(f":question: PO `{po_num}` not found.")
-                return
-
-            shipment = camelot_client.get_shipment_detail(shipment_id)
-            result = evaluate_shipment(po, shipment)
+            po = workflow.fetch_po(clients, po_num)
+            result = workflow.check_shipment_quantities(clients, po, shipment_id)
             say(format_shipment_summary(result))
+        except workflow.PONotFound:
+            say(f":question: PO `{po_num}` not found.")
         except Exception as e:
             print(
                 f"Error handling /po-ship-check {po_num!r} {shipment_id!r}: {e}",

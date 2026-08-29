@@ -1,0 +1,318 @@
+"""Business logic shared by the CLI (main.py) and the Slack listener.
+
+Both are thin adapters over this module: everything here returns a value or
+raises WorkflowError, and nothing prints or calls sys.exit, so the same call
+sequence can be rendered to a terminal or to a Slack message.
+
+WorkflowError messages are written to be safe to show to an end user as-is
+(no credentials, no tracebacks) -- callers should render str(e) directly
+rather than reformatting it.
+
+Deliberately NOT done here: caching. load_price_map() re-reads the Google
+Sheet on every call, matching the current behavior; callers that evaluate
+several POs should load it once and pass it in. A TTL cache belongs with the
+rest of the headless hardening, not in this extraction.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any
+from xml.etree import ElementTree
+
+import csv_po
+import price_list
+from camelot_client import CamelotClient
+from compare import POResult, evaluate_po
+from compare_shipment import ShipmentResult, evaluate_shipment
+from config import Config
+from odoo_client import OdooClient
+from spring_client import SpringSystemsClient, build_invoice_request_xml, get_line_items
+
+
+class WorkflowError(Exception):
+    """A condition the caller should report to the user -- not a bug."""
+
+
+class PONotFound(WorkflowError):
+    """Raised when a PO number doesn't resolve, so callers can render it
+    differently from a genuine failure (Slack uses :question: not :warning:)."""
+
+
+# (env var name, Config attribute) pairs, grouped by the integration that needs them.
+_SPRING_ENV = (
+    ("SPRING_API_BASE_URL", "spring_base_url"),
+    ("SPRING_API_USER", "spring_api_user"),
+    ("SPRING_API_KEY", "spring_api_key"),
+)
+_CAMELOT_ENV = (
+    ("CAMELOT_SOAP_URL", "camelot_soap_url"),
+    ("CAMELOT_USERNAME", "camelot_username"),
+    ("CAMELOT_PASSWORD", "camelot_password"),
+    ("CAMELOT_CLIENT", "camelot_client_code"),
+    ("CAMELOT_TRADING_PARTNER", "camelot_trading_partner"),
+    ("CAMELOT_SHIPMENT_PROFILE", "camelot_shipment_profile"),
+)
+_RETAILER_ENV = (("SPRING_RETAILER_ID", "spring_retailer_id"),)
+_SLACK_BOT_ENV = (
+    ("SLACK_BOT_TOKEN", "slack_bot_token"),
+    ("SLACK_APP_TOKEN", "slack_app_token"),
+)
+_ODOO_ENV = (
+    ("ODOO_DB_URL", "odoo_db_url"),
+    ("ODOO_DB_NAME", "odoo_db_name"),
+    ("ODOO_USER", "odoo_user"),
+    ("ODOO_API_KEY", "odoo_api_key"),
+    ("ODOO_COMPANY_ID", "odoo_company_id"),
+    ("ODOO_JOURNAL_ID", "odoo_journal_id"),
+    ("ODOO_TARGET_PARTNER_ID", "odoo_target_partner_id"),
+)
+
+
+def _require(config: Config, group: tuple[tuple[str, str], ...], hint: str = "") -> None:
+    missing = [name for name, attr in group if not getattr(config, attr)]
+    if missing:
+        message = f"Missing required environment variable(s): {', '.join(missing)}."
+        raise WorkflowError(f"{message} {hint}" if hint else message)
+
+
+def require_spring_env(config: Config, hint: str = "") -> None:
+    _require(config, _SPRING_ENV, hint)
+
+
+def require_camelot_env(config: Config, hint: str = "") -> None:
+    _require(config, _CAMELOT_ENV, hint)
+
+
+def require_odoo_env(config: Config, hint: str = "") -> None:
+    _require(config, _ODOO_ENV, hint)
+
+
+def require_batch_env(config: Config, hint: str = "") -> None:
+    """The batch "review new POs" run. SPRING_RETAILER_ID is required even when
+    --retailer-id overrides it -- preserved from the pre-refactor behavior; it
+    looks like an oversight, but changing it is a behavior change, not a move."""
+    _require(config, _SPRING_ENV + _RETAILER_ENV, hint)
+
+
+def require_listener_env(config: Config, hint: str = "") -> None:
+    """Everything slack_listener.py needs to start, reported in one message so
+    a fresh deployment sees every missing var at once instead of one per restart."""
+    _require(config, _SPRING_ENV + _SLACK_BOT_ENV + _CAMELOT_ENV, hint)
+
+
+def require_odoo_push_env(config: Config, hint: str = "") -> None:
+    """Both groups at once, so a caller missing vars from each is told about
+    all of them in one message rather than one group at a time."""
+    _require(config, _SPRING_ENV + _ODOO_ENV, hint)
+
+
+@dataclass
+class Clients:
+    """Lazily-built API clients, so a caller that only needs Spring never
+    authenticates against Odoo (OdooClient authenticates on construction).
+
+    Build one per CLI run; the Slack listener builds one at startup and reuses
+    it, which keeps the underlying requests.Session connection pools warm.
+    """
+
+    config: Config
+    _spring: SpringSystemsClient | None = field(default=None, repr=False)
+    _camelot: CamelotClient | None = field(default=None, repr=False)
+    _odoo: OdooClient | None = field(default=None, repr=False)
+
+    @property
+    def spring(self) -> SpringSystemsClient:
+        if self._spring is None:
+            require_spring_env(self.config)
+            self._spring = SpringSystemsClient(
+                base_url=self.config.spring_base_url,
+                api_user=self.config.spring_api_user,
+                api_key=self.config.spring_api_key,
+            )
+        return self._spring
+
+    @property
+    def camelot(self) -> CamelotClient:
+        if self._camelot is None:
+            require_camelot_env(self.config)
+            self._camelot = CamelotClient(
+                soap_url=self.config.camelot_soap_url,
+                username=self.config.camelot_username,
+                password=self.config.camelot_password,
+                client_code=self.config.camelot_client_code,
+                trading_partner=self.config.camelot_trading_partner,
+                shipment_profile=self.config.camelot_shipment_profile,
+            )
+        return self._camelot
+
+    @property
+    def odoo(self) -> OdooClient:
+        if self._odoo is None:
+            require_odoo_env(self.config)
+            self._odoo = OdooClient(
+                url=self.config.odoo_db_url,
+                db=self.config.odoo_db_name,
+                login=self.config.odoo_user,
+                api_key=self.config.odoo_api_key,
+            )
+        return self._odoo
+
+
+# --- PO lookup and review -------------------------------------------------
+
+
+def fetch_po(clients: Clients, po_num: str, *, from_csv: str | None = None) -> dict[str, Any]:
+    """Resolve a single PO by number, from the live API or a local CSV export."""
+    if from_csv:
+        po = next(
+            (p for p in csv_po.load_pos_from_csv(from_csv) if str(p.get("po_num")) == po_num),
+            None,
+        )
+    else:
+        po = clients.spring.get_po_by_num(po_num)
+    if po is None:
+        raise PONotFound(f"PO {po_num} not found.")
+    return po
+
+
+def fetch_retailer_pos(clients: Clients, retailer_id: str) -> list[dict[str, Any]]:
+    return clients.spring.get_pos_for_retailer(retailer_id)
+
+
+def load_price_map(config: Config) -> dict[str, float]:
+    return price_list.load_prices(
+        sheet_id=config.google_sheet_id,
+        credentials_path=config.google_credentials_path,
+        token_path=config.google_token_path,
+        worksheet_name=config.price_sheet_worksheet,
+        sku_column=config.price_sheet_sku_column,
+        price_column=config.price_sheet_price_column,
+    )
+
+
+def review_pricing(po: dict[str, Any], price_map: dict[str, float]) -> POResult:
+    return evaluate_po(po, price_map)
+
+
+def check_shipment_quantities(
+    clients: Clients, po: dict[str, Any], shipment_id: str
+) -> ShipmentResult:
+    shipment = clients.camelot.get_shipment_detail(shipment_id)
+    return evaluate_shipment(po, shipment)
+
+
+# --- Odoo draft invoices --------------------------------------------------
+
+
+@dataclass
+class OdooInvoiceLine:
+    sku: str
+    product_id: int
+    quantity: float
+    price_unit: float
+
+
+@dataclass
+class OdooInvoicePlan:
+    """Everything needed to create the Odoo invoice, resolved but not yet sent
+    -- so a dry run can render exactly what a real run would create."""
+
+    po_num: str
+    invoice_num: str
+    invoice_date: str | None
+    company_id: int
+    journal_id: int
+    partner_id: int
+    lines: list[OdooInvoiceLine]
+
+    @property
+    def total(self) -> float:
+        return sum(line.quantity * line.price_unit for line in self.lines)
+
+
+def plan_odoo_invoice(
+    clients: Clients, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+) -> OdooInvoicePlan:
+    """Resolve each PO line's SKU to an Odoo product id. Raises rather than
+    creating a partial invoice if any SKU is unknown to Odoo."""
+    line_items = get_line_items(po)
+    po_num = str(po.get("po_num", ""))
+    if not line_items:
+        raise WorkflowError(f"PO {po_num} has no line items to invoice.")
+
+    odoo = clients.odoo
+    lines: list[OdooInvoiceLine] = []
+    missing_skus: list[str] = []
+    for item in line_items:
+        sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
+        product_id = odoo.find_product_id_by_sku(sku)
+        if product_id is None:
+            missing_skus.append(sku)
+            continue
+        lines.append(
+            OdooInvoiceLine(
+                sku=sku,
+                product_id=product_id,
+                quantity=float(item.get("po_item_qty_ordered", 0) or 0),
+                price_unit=float(item.get("po_item_unit_price", 0) or 0),
+            )
+        )
+    if missing_skus:
+        raise WorkflowError(
+            f"SKU(s) not found in Odoo (no product.product with that exact default_code): "
+            f"{missing_skus}. Aborting -- fix the product records first."
+        )
+
+    config = clients.config
+    return OdooInvoicePlan(
+        po_num=po_num,
+        invoice_num=invoice_num,
+        invoice_date=invoice_date,
+        company_id=int(config.odoo_company_id),
+        journal_id=int(config.odoo_journal_id),
+        partner_id=int(config.odoo_target_partner_id),
+        lines=lines,
+    )
+
+
+def create_odoo_invoice(clients: Clients, plan: OdooInvoicePlan) -> int:
+    """Creates the DRAFT invoice and returns its account.move id. Never posts."""
+    return clients.odoo.create_draft_invoice(
+        company_id=plan.company_id,
+        journal_id=plan.journal_id,
+        partner_id=plan.partner_id,
+        po_num=plan.po_num,
+        invoice_num=plan.invoice_num,
+        invoice_date=plan.invoice_date,
+        lines=[
+            {"product_id": line.product_id, "quantity": line.quantity, "price_unit": line.price_unit}
+            for line in plan.lines
+        ],
+    )
+
+
+# --- Spring invoices ------------------------------------------------------
+
+
+def build_spring_invoice_xml(
+    config: Config, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+) -> ElementTree.Element:
+    """The request body send_spring_invoice would POST. SPRING_VENDOR_ID isn't
+    required just to preview it, so an unset one is rendered as a placeholder."""
+    vendor_id = config.spring_vendor_id or "<SPRING_VENDOR_ID not set>"
+    return build_invoice_request_xml(po, invoice_num, vendor_id, invoice_date)
+
+
+def send_spring_invoice(
+    clients: Clients, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+) -> dict[str, Any]:
+    """WARNING: may transmit an EDI 810 to the retailer -- see
+    SpringSystemsClient.create_invoice. Callers must confirm before calling."""
+    if not clients.config.spring_vendor_id:
+        raise WorkflowError("SPRING_VENDOR_ID is not set. Set it in .env or use --dry-run.")
+    return clients.spring.create_invoice(
+        po, invoice_num, clients.config.spring_vendor_id, invoice_date=invoice_date
+    )
+
+
+def list_invoices_since(clients: Clients, date_str: str) -> list[dict[str, Any]]:
+    return clients.spring.get_invoices_created_since(date_str)

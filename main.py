@@ -2,6 +2,10 @@
 """PO pricing review: pull POs from Spring Systems, check line prices against
 the price list, and post a pass/fail summary to Slack.
 
+This is the CLI adapter over workflow.py -- it parses flags, renders results to
+the terminal or Slack, and maps failures to exit codes. The actual Spring /
+Camelot / Odoo logic lives in workflow.py, shared with slack_listener.py.
+
 Usage:
     python main.py --dry-run              # print summaries instead of posting to Slack
     python main.py                        # post new POs' summaries to Slack
@@ -40,15 +44,14 @@ from xml.dom import minidom
 from xml.etree import ElementTree
 
 import csv_po
-import price_list
 import state
-from camelot_client import CamelotClient
-from compare import evaluate_po
-from compare_shipment import evaluate_shipment
+import workflow
 from config import Config
 from slack_notify import format_shipment_summary, format_summary, post_shipment_summary, post_summary
-from odoo_client import OdooClient
-from spring_client import SpringSystemsClient, build_invoice_request_xml, get_line_items
+
+_CSV_HINT = "Set them in .env, or use --from-csv."
+_ENV_HINT = "Set them in .env."
+_BATCH_HINT = "Set them in .env, or use --from-csv to test without the API."
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,125 +127,41 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_shipment_check(
-    po_num: str, shipment_id: str, config: Config, args: argparse.Namespace
+    po_num: str, shipment_id: str, clients: workflow.Clients, args: argparse.Namespace
 ) -> int:
-    if args.from_csv:
-        po = next(
-            (p for p in csv_po.load_pos_from_csv(args.from_csv) if str(p.get("po_num")) == po_num),
-            None,
-        )
-    else:
-        missing = [
-            name
-            for name, value in [
-                ("SPRING_API_BASE_URL", config.spring_base_url),
-                ("SPRING_API_USER", config.spring_api_user),
-                ("SPRING_API_KEY", config.spring_api_key),
-            ]
-            if not value
-        ]
-        if missing:
-            print(
-                f"Missing required environment variable(s): {', '.join(missing)}. "
-                "Set them in .env, or use --from-csv.",
-                file=sys.stderr,
-            )
-            return 1
-        spring_client = SpringSystemsClient(
-            base_url=config.spring_base_url,
-            api_user=config.spring_api_user,
-            api_key=config.spring_api_key,
-        )
-        po = spring_client.get_po_by_num(po_num)
-
-    if po is None:
-        print(f"PO {po_num} not found.", file=sys.stderr)
-        return 1
-
-    camelot_missing = [
-        name
-        for name, value in [
-            ("CAMELOT_SOAP_URL", config.camelot_soap_url),
-            ("CAMELOT_USERNAME", config.camelot_username),
-            ("CAMELOT_PASSWORD", config.camelot_password),
-            ("CAMELOT_CLIENT", config.camelot_client_code),
-            ("CAMELOT_TRADING_PARTNER", config.camelot_trading_partner),
-            ("CAMELOT_SHIPMENT_PROFILE", config.camelot_shipment_profile),
-        ]
-        if not value
-    ]
-    if camelot_missing:
-        print(
-            f"Missing required environment variable(s): {', '.join(camelot_missing)}. "
-            "Set them in .env.",
-            file=sys.stderr,
-        )
-        return 1
-
-    camelot_client = CamelotClient(
-        soap_url=config.camelot_soap_url,
-        username=config.camelot_username,
-        password=config.camelot_password,
-        client_code=config.camelot_client_code,
-        trading_partner=config.camelot_trading_partner,
-        shipment_profile=config.camelot_shipment_profile,
-    )
-    shipment = camelot_client.get_shipment_detail(shipment_id)
-    result = evaluate_shipment(po, shipment)
+    if not args.from_csv:
+        workflow.require_spring_env(clients.config, _CSV_HINT)
+    po = workflow.fetch_po(clients, po_num, from_csv=args.from_csv)
+    workflow.require_camelot_env(clients.config, _ENV_HINT)
+    result = workflow.check_shipment_quantities(clients, po, shipment_id)
 
     if args.dry_run:
         print(format_shipment_summary(result))
         return 0
 
-    if not config.slack_webhook_url:
+    if not clients.config.slack_webhook_url:
         print("SLACK_WEBHOOK_URL is not set. Set it in .env or use --dry-run.", file=sys.stderr)
         return 1
-    post_shipment_summary(result, config.slack_webhook_url)
+    post_shipment_summary(result, clients.config.slack_webhook_url)
     print(f"Posted shipment check for PO {po_num} ({result.status.value}) to Slack.")
     return 0
 
 
-def _missing_env(pairs: list[tuple[str, str | None]]) -> list[str]:
-    return [name for name, value in pairs if not value]
-
-
 def _run_create_invoice(
-    po_num: str, invoice_num: str, config: Config, args: argparse.Namespace
+    po_num: str, invoice_num: str, clients: workflow.Clients, args: argparse.Namespace
 ) -> int:
-    missing = _missing_env(
-        [
-            ("SPRING_API_BASE_URL", config.spring_base_url),
-            ("SPRING_API_USER", config.spring_api_user),
-            ("SPRING_API_KEY", config.spring_api_key),
-        ]
-    )
-    if missing:
-        print(f"Missing required environment variable(s): {', '.join(missing)}.", file=sys.stderr)
-        return 1
-
-    client = SpringSystemsClient(
-        base_url=config.spring_base_url,
-        api_user=config.spring_api_user,
-        api_key=config.spring_api_key,
-    )
-    po = client.get_po_by_num(po_num)
-    if po is None:
-        print(f"PO {po_num} not found.", file=sys.stderr)
-        return 1
+    po = workflow.fetch_po(clients, po_num)
 
     if args.dry_run:
-        # SPRING_VENDOR_ID isn't required just to preview the XML.
-        vendor_id = config.spring_vendor_id or "<SPRING_VENDOR_ID not set>"
-        invoices_xml = build_invoice_request_xml(po, invoice_num, vendor_id, args.invoice_date)
-        pretty = minidom.parseString(
-            ElementTree.tostring(invoices_xml, encoding="unicode")
-        ).toprettyxml(indent="  ")
-        print(pretty)
+        invoices_xml = workflow.build_spring_invoice_xml(
+            clients.config, po, invoice_num, args.invoice_date
+        )
+        print(
+            minidom.parseString(
+                ElementTree.tostring(invoices_xml, encoding="unicode")
+            ).toprettyxml(indent="  ")
+        )
         return 0
-
-    if not config.spring_vendor_id:
-        print("SPRING_VENDOR_ID is not set. Set it in .env or use --dry-run.", file=sys.stderr)
-        return 1
 
     print(
         "WARNING: draft-vs-send behavior for Spring's invoice-incoming/send/ endpoint is "
@@ -250,7 +169,7 @@ def _run_create_invoice(
         "retailer. Proceeding...",
         file=sys.stderr,
     )
-    result = client.create_invoice(po, invoice_num, config.spring_vendor_id, invoice_date=args.invoice_date)
+    result = workflow.send_spring_invoice(clients, po, invoice_num, args.invoice_date)
     print(
         f"Created invoice {result.get('invoice_num')} (id={result.get('invoice_id')}, "
         f"status={result.get('invoice_status')}) for PO {po_num}."
@@ -258,25 +177,9 @@ def _run_create_invoice(
     return 0
 
 
-def _run_list_invoices(date_arg: str, config: Config) -> int:
-    missing = _missing_env(
-        [
-            ("SPRING_API_BASE_URL", config.spring_base_url),
-            ("SPRING_API_USER", config.spring_api_user),
-            ("SPRING_API_KEY", config.spring_api_key),
-        ]
-    )
-    if missing:
-        print(f"Missing required environment variable(s): {', '.join(missing)}.", file=sys.stderr)
-        return 1
-
+def _run_list_invoices(date_arg: str, clients: workflow.Clients) -> int:
     date_str = date.today().isoformat() if date_arg == "TODAY" else date_arg
-    client = SpringSystemsClient(
-        base_url=config.spring_base_url,
-        api_user=config.spring_api_user,
-        api_key=config.spring_api_key,
-    )
-    invoices = client.get_invoices_created_since(date_str)
+    invoices = workflow.list_invoices_since(clients, date_str)
     if not invoices:
         print(f"No invoices created on/after {date_str}.")
         return 0
@@ -291,144 +194,46 @@ def _run_list_invoices(date_arg: str, config: Config) -> int:
 
 
 def _run_push_odoo_invoice(
-    po_num: str, invoice_num: str, config: Config, args: argparse.Namespace
+    po_num: str, invoice_num: str, clients: workflow.Clients, args: argparse.Namespace
 ) -> int:
-    missing = _missing_env(
-        [
-            ("SPRING_API_BASE_URL", config.spring_base_url),
-            ("SPRING_API_USER", config.spring_api_user),
-            ("SPRING_API_KEY", config.spring_api_key),
-            ("ODOO_DB_URL", config.odoo_db_url),
-            ("ODOO_DB_NAME", config.odoo_db_name),
-            ("ODOO_USER", config.odoo_user),
-            ("ODOO_API_KEY", config.odoo_api_key),
-            ("ODOO_COMPANY_ID", config.odoo_company_id),
-            ("ODOO_JOURNAL_ID", config.odoo_journal_id),
-            ("ODOO_TARGET_PARTNER_ID", config.odoo_target_partner_id),
-        ]
-    )
-    if missing:
-        print(f"Missing required environment variable(s): {', '.join(missing)}.", file=sys.stderr)
-        return 1
-
-    spring_client = SpringSystemsClient(
-        base_url=config.spring_base_url,
-        api_user=config.spring_api_user,
-        api_key=config.spring_api_key,
-    )
-    po = spring_client.get_po_by_num(po_num)
-    if po is None:
-        print(f"PO {po_num} not found.", file=sys.stderr)
-        return 1
-    line_items = get_line_items(po)
-    if not line_items:
-        print(f"PO {po_num} has no line items to invoice.", file=sys.stderr)
-        return 1
-
-    odoo = OdooClient(
-        url=config.odoo_db_url,
-        db=config.odoo_db_name,
-        login=config.odoo_user,
-        api_key=config.odoo_api_key,
-    )
-
-    lines = []
-    missing_skus = []
-    for item in line_items:
-        sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
-        product_id = odoo.find_product_id_by_sku(sku)
-        if product_id is None:
-            missing_skus.append(sku)
-            continue
-        lines.append(
-            {
-                "sku": sku,
-                "product_id": product_id,
-                "quantity": float(item.get("po_item_qty_ordered", 0) or 0),
-                "price_unit": float(item.get("po_item_unit_price", 0) or 0),
-            }
-        )
-    if missing_skus:
-        print(
-            f"SKU(s) not found in Odoo (no product.product with that exact default_code): "
-            f"{missing_skus}. Aborting -- fix the product records first.",
-            file=sys.stderr,
-        )
-        return 1
+    workflow.require_odoo_push_env(clients.config)
+    po = workflow.fetch_po(clients, po_num)
+    plan = workflow.plan_odoo_invoice(clients, po, invoice_num, args.invoice_date)
 
     if args.dry_run:
         print(f"Would create DRAFT Odoo invoice for PO {po_num}:")
-        print(f"  company_id={config.odoo_company_id} journal_id={config.odoo_journal_id} "
-              f"partner_id={config.odoo_target_partner_id}")
-        print(f"  ref={po_num!r} payment_reference={invoice_num!r} invoice_date={args.invoice_date!r}")
-        for line in lines:
-            print(f"  SKU {line['sku']} -> product_id={line['product_id']}, "
-                  f"qty={line['quantity']}, price_unit={line['price_unit']}")
-        total = sum(line["quantity"] * line["price_unit"] for line in lines)
-        print(f"  total={total:.2f}")
+        print(
+            f"  company_id={plan.company_id} journal_id={plan.journal_id} "
+            f"partner_id={plan.partner_id}"
+        )
+        print(
+            f"  ref={plan.po_num!r} payment_reference={plan.invoice_num!r} "
+            f"invoice_date={plan.invoice_date!r}"
+        )
+        for line in plan.lines:
+            print(
+                f"  SKU {line.sku} -> product_id={line.product_id}, "
+                f"qty={line.quantity}, price_unit={line.price_unit}"
+            )
+        print(f"  total={plan.total:.2f}")
         return 0
 
-    move_id = odoo.create_draft_invoice(
-        company_id=int(config.odoo_company_id),
-        journal_id=int(config.odoo_journal_id),
-        partner_id=int(config.odoo_target_partner_id),
-        po_num=po_num,
-        invoice_num=invoice_num,
-        invoice_date=args.invoice_date,
-        lines=lines,
+    move_id = workflow.create_odoo_invoice(clients, plan)
+    print(
+        f"Created DRAFT Odoo invoice (account.move id={move_id}) for PO {po_num}. "
+        f"Not posted -- review and post it in Odoo."
     )
-    print(f"Created DRAFT Odoo invoice (account.move id={move_id}) for PO {po_num}. "
-          f"Not posted -- review and post it in Odoo.")
     return 0
 
 
-def main() -> int:
-    args = parse_args()
-    config = Config.load()
-
-    if args.check_shipment:
-        po_num, shipment_id = args.check_shipment
-        return _run_shipment_check(po_num, shipment_id, config, args)
-
-    if args.create_invoice:
-        po_num, invoice_num = args.create_invoice
-        return _run_create_invoice(po_num, invoice_num, config, args)
-
-    if args.push_odoo_invoice:
-        po_num, invoice_num = args.push_odoo_invoice
-        return _run_push_odoo_invoice(po_num, invoice_num, config, args)
-
-    if args.list_invoices:
-        return _run_list_invoices(args.list_invoices, config)
-
+def _run_batch_review(clients: workflow.Clients, args: argparse.Namespace) -> int:
+    config = clients.config
     if args.from_csv:
         pos = csv_po.load_pos_from_csv(args.from_csv)
     else:
-        missing = [
-            name
-            for name, value in [
-                ("SPRING_API_BASE_URL", config.spring_base_url),
-                ("SPRING_API_USER", config.spring_api_user),
-                ("SPRING_API_KEY", config.spring_api_key),
-                ("SPRING_RETAILER_ID", config.spring_retailer_id),
-            ]
-            if not value
-        ]
-        if missing:
-            print(
-                f"Missing required environment variable(s): {', '.join(missing)}. "
-                "Set them in .env, or use --from-csv to test without the API.",
-                file=sys.stderr,
-            )
-            return 1
-
+        workflow.require_batch_env(config, _BATCH_HINT)
         retailer_id = args.retailer_id or config.spring_retailer_id
-        client = SpringSystemsClient(
-            base_url=config.spring_base_url,
-            api_user=config.spring_api_user,
-            api_key=config.spring_api_key,
-        )
-        pos = client.get_pos_for_retailer(retailer_id)
+        pos = workflow.fetch_retailer_pos(clients, retailer_id)
 
     if args.inspect_status:
         for po in pos:
@@ -450,17 +255,10 @@ def main() -> int:
         print("SLACK_WEBHOOK_URL is not set. Set it in .env or use --dry-run.", file=sys.stderr)
         return 1
 
-    price_map = price_list.load_prices(
-        sheet_id=config.google_sheet_id,
-        credentials_path=config.google_credentials_path,
-        token_path=config.google_token_path,
-        worksheet_name=config.price_sheet_worksheet,
-        sku_column=config.price_sheet_sku_column,
-        price_column=config.price_sheet_price_column,
-    )
+    price_map = workflow.load_price_map(config)
 
     for po in pos:
-        result = evaluate_po(po, price_map)
+        result = workflow.review_pricing(po, price_map)
         if args.dry_run:
             print(format_summary(result))
             print("-" * 40)
@@ -470,6 +268,36 @@ def main() -> int:
             print(f"Posted PO {result.po_num} ({result.status.value}) to Slack.")
 
     return 0
+
+
+def _dispatch(args: argparse.Namespace, clients: workflow.Clients) -> int:
+    if args.check_shipment:
+        po_num, shipment_id = args.check_shipment
+        return _run_shipment_check(po_num, shipment_id, clients, args)
+
+    if args.create_invoice:
+        po_num, invoice_num = args.create_invoice
+        return _run_create_invoice(po_num, invoice_num, clients, args)
+
+    if args.push_odoo_invoice:
+        po_num, invoice_num = args.push_odoo_invoice
+        return _run_push_odoo_invoice(po_num, invoice_num, clients, args)
+
+    if args.list_invoices:
+        return _run_list_invoices(args.list_invoices, clients)
+
+    return _run_batch_review(clients, args)
+
+
+def main() -> int:
+    args = parse_args()
+    config = Config.load()
+    clients = workflow.Clients(config)
+    try:
+        return _dispatch(args, clients)
+    except workflow.WorkflowError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
