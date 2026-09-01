@@ -1,6 +1,9 @@
 .env
 google-credentials.json
-google-token.json
+# Covers backups too (google-token.json.bak etc) -- these hold a live
+# refresh token and must never be committed.
+google-token.json*
+google-credentials.json*
 processed_pos.json
 __pycache__/
 *.pyc
