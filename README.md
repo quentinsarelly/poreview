@@ -39,24 +39,42 @@ invoice number and date, checks Spring and Odoo for an existing invoice, and
   [docs/spring-api-permission-request.md](docs/spring-api-permission-request.md)
   for the request sent to Spring Systems.
 
-  1. **Permission.** `POST invoice-incoming/send` returns
-     `405 Method Not Allowed` with `{"errors":["You do not have permission to
-     use this resource"]}` for API user `sarelly_odoo_prod_api`. It's an
-     authorization problem, not a routing one: the same URL with deliberately
-     bad credentials returns `401 Invalid API credentials`, so the route and
-     method are valid, and an `OPTIONS` probe returns the same 405 permission
-     error. Only Spring can fix this.
-  2. **Draft vs. send is unconfirmed.** Nothing in Spring's docs says whether
+  1. ~~**Permission.**~~ **RESOLVED 2026-09-01** — Spring granted
+     `sarelly_odoo_prod_api` access to `invoice-incoming/send`. Confirmed with
+     a read-only `OPTIONS` probe: the response moved from
+     `405 "You do not have permission to use this resource"` to
+     `400 "The system was unable to read the data you sent."`, i.e. the request
+     now passes authorization and fails at payload parsing, which is correct
+     for a body-less probe.
+  2. **Draft vs. send is still unconfirmed** — Spring's reply answered the
+     access question only. Nothing in Spring's docs says whether
      that call creates a draft or immediately transmits an EDI 810 to the
      retailer. One hint (not proof): real already-sent Target invoices show
      `invoice_status=1`, while Spring's own docs example shows
      `invoice_status=5` — but the docs define no meaning for either value.
 
-  Until both land, `/po-invoice` runs every check and creates the Odoo draft,
-  reporting the Spring step as skipped; raise the Spring invoice manually in
-  the portal. When they land, set `SPRING_INVOICE_ENABLED=true` and redeploy —
-  no code change. See the WARNING docstring on
+  Until (2) is settled, `/po-invoice` runs every check and creates the Odoo
+  draft, reporting the Spring step as skipped; raise the Spring invoice
+  manually in the portal. See the WARNING docstring on
   `SpringSystemsClient.create_invoice`.
+
+  **How to settle (2):** there is no probe for it — the only way to learn what
+  the call does is to make it. So test on a PO that genuinely needs invoicing,
+  ideally a low-value one, so that "it transmitted immediately" is an
+  acceptable outcome rather than a mistake:
+
+  ```bash
+  python main.py --prepare-invoice <po_num> <shipment_id>   # confirm READY
+  python main.py --push-odoo-invoice <po_num> <invoice_num> --invoice-date <YYYY-MM-DD>
+  python main.py --create-invoice   <po_num> <invoice_num> --invoice-date <YYYY-MM-DD>
+  python main.py --list-invoices <YYYY-MM-DD>
+  ```
+
+  Then read the new invoice's `latest_transmission_send_date`. Present means it
+  transmitted an EDI 810; absent means it is sitting as a draft. Baseline: every
+  portal-created invoice observed so far has that field set ~1s after creation.
+
+  Once known, set `SPRING_INVOICE_ENABLED=true` and redeploy — no code change.
 
 - **Target's receipt of an invoice isn't visible via the API.** Spring's
   invoice export carries `latest_transmission_send_date` (proof Spring sent
@@ -64,10 +82,11 @@ invoice number and date, checks Spring and Odoo for an existing invoice, and
   anywhere in the payload. Confirming Target actually accepted an invoice
   means checking Spring's portal transmission log or Target's Partners Online.
 
-- **Google OAuth consent screen status is unverified.** If it's still in
-  "Testing", Google expires the refresh token after 7 days and the deployed
-  listener will start failing with no browser available to re-consent from.
-  Check APIs & Services → OAuth consent screen and publish it.
+- ~~**Google OAuth consent screen status.**~~ **RESOLVED 2026-09-01** —
+  project `quentinautomation` was External + Testing, which expires refresh
+  tokens after 7 days. Now published, status **In production**, so that expiry
+  no longer applies. The app is unverified, which is fine here: verification
+  only governs the consent warning screen and user caps, not token lifetime.
 
 ## Setup
 

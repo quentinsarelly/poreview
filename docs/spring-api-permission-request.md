@@ -3,11 +3,16 @@ Record of the outstanding request to Spring Systems. Sent 2026-08-28; a
 follow-up was also sent asking what invoice_status values mean and where a
 997 functional acknowledgment from Target is visible.
 
-Blocks SPRING_INVOICE_ENABLED: until Spring both grants the permission and
-confirms the draft-vs-810 behavior, /po-invoice runs every check and creates
-the Odoo draft, and the Spring invoice is raised manually in the portal.
+STATUS 2026-09-01: Spring granted the permission (reply from Ahmad). Verified
+with a read-only OPTIONS probe -- 405 "no permission" became 400 "unable to
+read the data you sent", i.e. authorization now passes.
 
-Delete this file once both questions are answered and the flag is on.
+STILL OPEN: the draft-vs-810 question below was not answered. Until it is,
+SPRING_INVOICE_ENABLED stays off, /po-invoice creates only the Odoo draft, and
+the Spring invoice is raised manually in the portal. See README "Open
+questions" for how to settle it on the next PO that needs invoicing.
+
+Delete this file once that question is answered and the flag is on.
 -->
 
 Subject: API permission needed for invoice-incoming/send + question on draft vs. send behavior
