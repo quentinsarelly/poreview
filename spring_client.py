@@ -279,21 +279,27 @@ def build_invoice_request_xml(
     ElementTree.SubElement(invoice_po_el, "po_id").text = str(po.get("po_id", ""))
     for item in line_items:
         sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
-        qty = (
-            qty_overrides[sku]
-            if qty_overrides is not None
-            else item.get("po_item_qty_ordered", "")
-        )
+        if qty_overrides is not None:
+            # Format as integer if whole number, otherwise keep decimals
+            qty_val = qty_overrides[sku]
+            qty_str = str(int(qty_val)) if qty_val == int(qty_val) else str(qty_val)
+        else:
+            qty_str = str(item.get("po_item_qty_ordered", ""))
         item_el = ElementTree.SubElement(invoice_po_el, "invoice_po_item")
         ElementTree.SubElement(item_el, "po_item_id").text = str(item["po_item_id"])
-        ElementTree.SubElement(item_el, "invoice_po_item_qty").text = str(qty)
+        ElementTree.SubElement(item_el, "invoice_po_item_qty").text = qty_str
         ElementTree.SubElement(item_el, "invoice_po_item_price").text = str(item.get("po_item_unit_price", ""))
 
     return invoices_el
 
 
 def _parse_invoice_send_response(xml_text: str) -> dict[str, Any]:
-    root = ElementTree.fromstring(xml_text)
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError as e:
+        # Show what Spring actually returned (truncated for readability)
+        preview = xml_text[:500] if len(xml_text) > 500 else xml_text
+        raise RuntimeError(f"Spring returned invalid XML: {e}\nResponse: {preview!r}") from e
     errors_el = root.find("errors")
     if errors_el is not None:
         raise RuntimeError(f"Spring invoice send failed: {(errors_el.text or '').strip()}")
