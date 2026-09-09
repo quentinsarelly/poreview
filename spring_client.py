@@ -84,9 +84,13 @@ class SpringSystemsClient:
         invoice_num: str,
         vendor_tp_id: str,
         invoice_date: str | None = None,
+        *,
+        qty_overrides: dict[str, float] | None = None,
     ) -> dict[str, Any]:
-        """Create/send an invoice for a PO's full line items (qty/price as ordered --
-        intended to run only after evaluate_po has already confirmed pricing).
+        """Create/send an invoice for a PO's line items.
+
+        qty_overrides: if provided, invoice only items in this map using these
+        quantities (SKU → qty). Items not in the map are skipped.
 
         WARNING -- unconfirmed draft-vs-send behavior: Spring's docs do not document
         any way to create a "draft" invoice distinct from one that's immediately
@@ -102,7 +106,9 @@ class SpringSystemsClient:
         It" example for this endpoint didn't include a date field at all. Verify
         this lands correctly on the created invoice before trusting it.
         """
-        invoices_xml = build_invoice_request_xml(po, invoice_num, vendor_tp_id, invoice_date)
+        invoices_xml = build_invoice_request_xml(
+            po, invoice_num, vendor_tp_id, invoice_date, qty_overrides=qty_overrides
+        )
         url = f"{self.base_url.rstrip('/')}/invoice-incoming/send"
         response = self.session.post(
             url,
@@ -212,10 +218,31 @@ def build_invoice_request_xml(
     invoice_num: str,
     vendor_tp_id: str,
     invoice_date: str | None,
+    *,
+    qty_overrides: dict[str, float] | None = None,
 ) -> ElementTree.Element:
+    """Build invoice XML for Spring Systems API.
+
+    qty_overrides: if provided, invoice only items in this map using these
+    quantities (SKU → qty). Items not in the map are skipped.
+    """
     line_items = get_line_items(po)
     if not line_items:
         raise ValueError(f"PO {po.get('po_num')!r} has no line items to invoice.")
+
+    # Filter items if qty_overrides is provided
+    if qty_overrides is not None:
+        filtered_items = []
+        for item in line_items:
+            sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
+            if sku in qty_overrides:
+                filtered_items.append(item)
+        line_items = filtered_items
+        if not line_items:
+            raise ValueError(
+                f"PO {po.get('po_num')!r} has no line items matching the qty_overrides."
+            )
+
     missing_ids = [i for i, item in enumerate(line_items) if not item.get("po_item_id")]
     if missing_ids:
         raise ValueError(
@@ -224,10 +251,17 @@ def build_invoice_request_xml(
             "never have this; fetch the PO from the live API instead.)"
         )
 
-    total = sum(
-        float(item.get("po_item_qty_ordered", 0) or 0) * float(item.get("po_item_unit_price", 0) or 0)
-        for item in line_items
-    )
+    # Calculate total using overrides if provided
+    total = 0.0
+    for item in line_items:
+        sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
+        qty = (
+            qty_overrides[sku]
+            if qty_overrides is not None
+            else float(item.get("po_item_qty_ordered", 0) or 0)
+        )
+        price = float(item.get("po_item_unit_price", 0) or 0)
+        total += qty * price
 
     invoices_el = ElementTree.Element("invoices")
     invoice_el = ElementTree.SubElement(invoices_el, "invoice")
@@ -244,9 +278,15 @@ def build_invoice_request_xml(
     invoice_po_el = ElementTree.SubElement(invoice_el, "invoice_po")
     ElementTree.SubElement(invoice_po_el, "po_id").text = str(po.get("po_id", ""))
     for item in line_items:
+        sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
+        qty = (
+            qty_overrides[sku]
+            if qty_overrides is not None
+            else item.get("po_item_qty_ordered", "")
+        )
         item_el = ElementTree.SubElement(invoice_po_el, "invoice_po_item")
         ElementTree.SubElement(item_el, "po_item_id").text = str(item["po_item_id"])
-        ElementTree.SubElement(item_el, "invoice_po_item_qty").text = str(item.get("po_item_qty_ordered", ""))
+        ElementTree.SubElement(item_el, "invoice_po_item_qty").text = str(qty)
         ElementTree.SubElement(item_el, "invoice_po_item_price").text = str(item.get("po_item_unit_price", ""))
 
     return invoices_el

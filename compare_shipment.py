@@ -69,6 +69,24 @@ class ShipmentResult:
             return ShipmentStatus.NEEDS_REVIEW
         return ShipmentStatus.ALL_MATCH
 
+    @property
+    def shipped_items(self) -> dict[str, float]:
+        """Map of SKU → qty for items that were actually shipped (qty > 0).
+
+        Includes OK and QTY_MISMATCH lines (anything that shipped), excludes
+        NOT_SHIPPED and UNEXPECTED_ITEM.
+        """
+        return {
+            line.sku: line.qty_shipped
+            for line in self.lines
+            if line.qty_shipped > 0 and line.status != ShipmentLineStatus.UNEXPECTED_ITEM
+        }
+
+    @property
+    def partial_invoice_possible(self) -> bool:
+        """True if at least some ordered items were shipped, allowing partial invoicing."""
+        return bool(self.shipped_items)
+
 
 def evaluate_shipment(
     po: dict[str, Any], shipment: dict[str, Any] | None

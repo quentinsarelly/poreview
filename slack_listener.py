@@ -261,6 +261,80 @@ def main() -> int:
 
         _in_background(f"po-invoice-confirm {po_num}", work)
 
+    @app.action(slack_notify.PARTIAL_INVOICE_CONFIRM_ACTION)
+    def handle_partial_invoice_confirm(ack, body, respond):
+        ack()
+        try:
+            payload = json.loads(body["actions"][0]["value"])
+            po_num = payload["po_num"]
+            shipment_id = payload["shipment_id"]
+        except (KeyError, IndexError, ValueError) as e:
+            print(f"Malformed partial-invoice-confirm payload: {e}", file=sys.stderr)
+            respond(replace_original=False, text=":rotating_light: Couldn't read that button's data.")
+            return
+
+        user = body.get("user", {}).get("username") or body.get("user", {}).get("name", "someone")
+        respond(
+            replace_original=True,
+            text=f":hourglass_flowing_sand: Creating *partial* invoice for PO `{po_num}` (requested by {user})...",
+        )
+
+        def work() -> None:
+            try:
+                prep = workflow.prepare_invoice(clients, po_num, shipment_id)
+
+                # Re-validate that partial invoicing is still allowed
+                if not prep.partial_shipment_allowed:
+                    text, blocks = format_invoice_preparation(prep)
+                    respond(
+                        replace_original=True,
+                        text=text,
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f":no_entry: Nothing invoiced — PO `{po_num}` no longer allows partial invoicing.",
+                                },
+                            },
+                            *blocks,
+                        ],
+                    )
+                    return
+
+                if (
+                    prep.invoice_num != payload.get("invoice_num")
+                    or prep.invoice_date != payload.get("invoice_date")
+                ):
+                    respond(
+                        replace_original=True,
+                        text=(
+                            f":no_entry: Nothing invoiced — the derived invoice details changed "
+                            f"since that check.\nWas `{payload.get('invoice_num')}` dated "
+                            f"`{payload.get('invoice_date')}`, now `{prep.invoice_num}` dated "
+                            f"`{prep.invoice_date}`.\nRe-run `/po-invoice {po_num} {shipment_id}`."
+                        ),
+                    )
+                    return
+
+                outcome = workflow.execute_partial_invoicing(clients, prep)
+                respond(
+                    replace_original=True,
+                    text=f"PO {po_num} *partially* invoiced as {outcome.invoice_num} (requested by {user})\n"
+                    + format_invoicing_outcome(outcome),
+                )
+            except Exception as e:
+                print(f"Error partial-invoicing {po_num!r} {shipment_id!r}: {e}", file=sys.stderr)
+                respond(
+                    replace_original=True,
+                    text=(
+                        f":rotating_light: Error partial-invoicing PO `{po_num}`: {e}\n"
+                        "Check Odoo and Spring before retrying -- part of it may have gone through."
+                    ),
+                )
+
+        _in_background(f"po-partial-invoice-confirm {po_num}", work)
+
     SocketModeHandler(app, config.slack_app_token).start()
     return 0
 

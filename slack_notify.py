@@ -8,6 +8,7 @@ from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
 
 # action_id of the /po-invoice confirmation button, shared with slack_listener.
 INVOICE_CONFIRM_ACTION = "po_invoice_confirm"
+PARTIAL_INVOICE_CONFIRM_ACTION = "po_partial_invoice_confirm"
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2
@@ -162,6 +163,61 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
             _section(
                 "*Blocking:*\n" + "\n".join(f"• {b}" for b in prep.blockers)
             )
+        )
+
+    # Partial invoice button: shown when pricing passes but shipment has
+    # missing items. Allows invoicing only the items that were shipped.
+    if prep.partial_shipment_allowed and prep.invoice_num and prep.partial_total is not None:
+        shipped_items = prep.shipment.shipped_items
+        shipped_count = len(shipped_items)
+        total_lines = len(prep.shipment.lines)
+        not_shipped_skus = [
+            line.sku for line in prep.shipment.lines
+            if line.status == ShipmentLineStatus.NOT_SHIPPED
+        ]
+        blocks.append(
+            _section(
+                f":package: *Partial invoice available* — {shipped_count}/{total_lines} line items shipped\n"
+                f"*Partial total* {prep.partial_total:,.2f}"
+            )
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": PARTIAL_INVOICE_CONFIRM_ACTION,
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": "Invoice shipped items only"},
+                        "value": json.dumps(
+                            {
+                                "po_num": prep.po_num,
+                                "shipment_id": prep.shipment_id,
+                                "invoice_num": prep.invoice_num,
+                                "invoice_date": prep.invoice_date,
+                                "partial_total": prep.partial_total,
+                            }
+                        ),
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Invoice shipped items only?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"Creates a *partial* invoice for *{prep.po_num}* "
+                                    f"as `{prep.invoice_num}` dated `{prep.invoice_date}` "
+                                    f"for *{prep.partial_total:,.2f}*.\n\n"
+                                    f"*Skipped (not shipped):* {', '.join(not_shipped_skus) or 'none'}\n\n"
+                                    "The Spring step may transmit an EDI 810 to Target "
+                                    "and cannot be undone."
+                                ),
+                            },
+                            "confirm": {"type": "plain_text", "text": "Create partial"},
+                            "deny": {"type": "plain_text", "text": "Cancel"},
+                        },
+                    }
+                ],
+            }
         )
 
     # invoice_num is always set when nothing blocks, but attaching a confirm

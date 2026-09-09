@@ -258,10 +258,19 @@ class OdooInvoicePlan:
 
 
 def plan_odoo_invoice(
-    clients: Clients, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+    clients: Clients,
+    po: dict[str, Any],
+    invoice_num: str,
+    invoice_date: str | None,
+    *,
+    qty_overrides: dict[str, float] | None = None,
 ) -> OdooInvoicePlan:
     """Resolve each PO line's SKU to an Odoo product id. Raises rather than
-    creating a partial invoice if any SKU is unknown to Odoo."""
+    creating a partial invoice if any SKU is unknown to Odoo.
+
+    qty_overrides: if provided, use these quantities instead of po_item_qty_ordered.
+    Lines whose SKU is not in qty_overrides are skipped (partial invoice).
+    """
     line_items = get_line_items(po)
     po_num = str(po.get("po_num", ""))
     if not line_items:
@@ -272,15 +281,23 @@ def plan_odoo_invoice(
     missing_skus: list[str] = []
     for item in line_items:
         sku = str(item.get("product", {}).get("product_vendor_item_num", "")).strip()
+        # If qty_overrides is set, skip lines not in the override map
+        if qty_overrides is not None and sku not in qty_overrides:
+            continue
         product_id = odoo.find_product_id_by_sku(sku)
         if product_id is None:
             missing_skus.append(sku)
             continue
+        quantity = (
+            qty_overrides[sku]
+            if qty_overrides is not None
+            else float(item.get("po_item_qty_ordered", 0) or 0)
+        )
         lines.append(
             OdooInvoiceLine(
                 sku=sku,
                 product_id=product_id,
-                quantity=float(item.get("po_item_qty_ordered", 0) or 0),
+                quantity=quantity,
                 price_unit=float(item.get("po_item_unit_price", 0) or 0),
             )
         )
@@ -322,23 +339,43 @@ def create_odoo_invoice(clients: Clients, plan: OdooInvoicePlan) -> int:
 
 
 def build_spring_invoice_xml(
-    config: Config, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+    config: Config,
+    po: dict[str, Any],
+    invoice_num: str,
+    invoice_date: str | None,
+    *,
+    qty_overrides: dict[str, float] | None = None,
 ) -> ElementTree.Element:
     """The request body send_spring_invoice would POST. SPRING_VENDOR_ID isn't
     required just to preview it, so an unset one is rendered as a placeholder."""
     vendor_id = config.spring_vendor_id or "<SPRING_VENDOR_ID not set>"
-    return build_invoice_request_xml(po, invoice_num, vendor_id, invoice_date)
+    return build_invoice_request_xml(
+        po, invoice_num, vendor_id, invoice_date, qty_overrides=qty_overrides
+    )
 
 
 def send_spring_invoice(
-    clients: Clients, po: dict[str, Any], invoice_num: str, invoice_date: str | None
+    clients: Clients,
+    po: dict[str, Any],
+    invoice_num: str,
+    invoice_date: str | None,
+    *,
+    qty_overrides: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """WARNING: may transmit an EDI 810 to the retailer -- see
-    SpringSystemsClient.create_invoice. Callers must confirm before calling."""
+    SpringSystemsClient.create_invoice. Callers must confirm before calling.
+
+    qty_overrides: if provided, invoice only items in this map using these
+    quantities (SKU → qty). Items not in the map are skipped.
+    """
     if not clients.config.spring_vendor_id:
         raise WorkflowError("SPRING_VENDOR_ID is not set. Set it in .env or use --dry-run.")
     return clients.spring.create_invoice(
-        po, invoice_num, clients.config.spring_vendor_id, invoice_date=invoice_date
+        po,
+        invoice_num,
+        clients.config.spring_vendor_id,
+        invoice_date=invoice_date,
+        qty_overrides=qty_overrides,
     )
 
 
@@ -451,6 +488,10 @@ class InvoicePreparation:
     # How invoice_num was arrived at -- which numbers were skipped because
     # another PO owns them, or which number this PO already holds.
     number_resolution: "InvoiceNumberResolution | None" = None
+    # Partial shipment: when some items weren't shipped, allow invoicing only
+    # what was shipped. partial_total is the sum using shipped quantities.
+    partial_shipment_allowed: bool = False
+    partial_total: float | None = None
 
     @property
     def ready(self) -> bool:
@@ -537,6 +578,25 @@ def prepare_invoice(
 
     total = sum(line.qty_ordered * line.price_ordered for line in pricing.lines)
 
+    # Check if partial invoicing is possible: pricing passes but shipment has
+    # missing items. partial_total uses shipped quantities instead of ordered.
+    partial_shipment_allowed = False
+    partial_total: float | None = None
+    if (
+        pricing.status == POStatus.ALL_MATCH
+        and shipment.status == ShipmentStatus.NEEDS_REVIEW
+        and shipment.partial_invoice_possible
+    ):
+        partial_shipment_allowed = True
+        # Build a price map from pricing.lines (SKU → unit price)
+        sku_prices = {line.sku: line.price_ordered for line in pricing.lines}
+        shipped_items = shipment.shipped_items
+        partial_total = sum(
+            shipped_items.get(sku, 0.0) * price
+            for sku, price in sku_prices.items()
+            if sku in shipped_items
+        )
+
     return InvoicePreparation(
         po=po,
         po_num=po_num,
@@ -548,6 +608,8 @@ def prepare_invoice(
         total=total,
         blockers=blockers,
         number_resolution=resolution,
+        partial_shipment_allowed=partial_shipment_allowed,
+        partial_total=partial_total,
     )
 
 
@@ -592,6 +654,55 @@ def execute_invoicing(clients: Clients, prep: InvoicePreparation) -> InvoicingOu
     try:
         outcome.spring_result = send_spring_invoice(
             clients, prep.po, prep.invoice_num, prep.invoice_date
+        )
+    except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
+        outcome.spring_error = f"{type(e).__name__}: {e}"
+    return outcome
+
+
+def execute_partial_invoicing(
+    clients: Clients, prep: InvoicePreparation
+) -> InvoicingOutcome:
+    """Create invoices for only the items that were actually shipped.
+
+    Like execute_invoicing, but uses shipped quantities instead of ordered
+    quantities. Requires partial_shipment_allowed to be True (pricing passes,
+    shipment has some items shipped).
+    """
+    if not prep.partial_shipment_allowed:
+        raise WorkflowError(
+            f"PO {prep.po_num} does not allow partial invoicing. "
+            "Pricing must pass and at least some items must be shipped."
+        )
+    if not prep.invoice_num:
+        raise WorkflowError(
+            f"PO {prep.po_num} has no invoice number derived. "
+            f"Blockers: {' '.join(prep.blockers)}"
+        )
+
+    # Use shipped quantities from the shipment check
+    qty_overrides = prep.shipment.shipped_items
+
+    plan = plan_odoo_invoice(
+        clients, prep.po, prep.invoice_num, prep.invoice_date, qty_overrides=qty_overrides
+    )
+    move_id = create_odoo_invoice(clients, plan)
+
+    outcome = InvoicingOutcome(
+        invoice_num=prep.invoice_num,
+        invoice_date=prep.invoice_date,
+        odoo_move_id=move_id,
+    )
+
+    if not clients.config.spring_invoice_enabled:
+        outcome.spring_skipped = (
+            "SPRING_INVOICE_ENABLED is off -- no invoice was sent to Spring/Target."
+        )
+        return outcome
+
+    try:
+        outcome.spring_result = send_spring_invoice(
+            clients, prep.po, prep.invoice_num, prep.invoice_date, qty_overrides=qty_overrides
         )
     except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
         outcome.spring_error = f"{type(e).__name__}: {e}"
