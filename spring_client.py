@@ -78,6 +78,36 @@ class SpringSystemsClient:
         """date: YYYY-MM-DD. Returns invoices created on or after that date."""
         return self.get_invoices("invoice_created", "gte", date)
 
+    def get_shipments(self, attr: str, op: str, value: str) -> list[dict[str, Any]]:
+        """Fetch shipments matching a filter condition.
+        See: https://springsystems.readme.io/reference/get-shipments
+
+        Valid attrs: ship_info_id, vendor_id, retailer_id, ship_from_location_id,
+        ship_to_location_id, ship_info_tracking, ship_info_ship_date,
+        ship_info_delivery_date, ship_info_status, ship_info_invoice_status,
+        ship_info_created, ship_info_updated
+        """
+        url: str | None = (
+            f"{self.base_url.rstrip('/')}/ship-outgoing/export/"
+            f"ship_info.filter.{op}.{attr}/{value}"
+        )
+        shipments: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        while url and url not in seen_urls:
+            seen_urls.add(url)
+            response = self.session.get(
+                url, auth=(self.api_user, self.api_key), timeout=30
+            )
+            response.raise_for_status()
+            shipments.extend(_parse_shipments_xml(response.text))
+            url = _next_page_url(response.headers)
+        return shipments
+
+    def get_shipment_by_id(self, ship_info_id: str) -> dict[str, Any] | None:
+        """Get a shipment by its Spring ship_info_id."""
+        matches = self.get_shipments("ship_info_id", "eq", ship_info_id)
+        return matches[0] if matches else None
+
     def create_invoice(
         self,
         po: dict[str, Any],
@@ -211,6 +241,39 @@ def _parse_invoice_element(invoice_el: ElementTree.Element) -> dict[str, Any]:
 def _parse_invoices_xml(xml_text: str) -> list[dict[str, Any]]:
     root = ElementTree.fromstring(xml_text)
     return [_parse_invoice_element(el) for el in root.findall("invoice")]
+
+
+def _parse_shipments_xml(xml_text: str) -> list[dict[str, Any]]:
+    """Parse shipment (940) export response. Fields based on typical EDI 940 structure."""
+    root = ElementTree.fromstring(xml_text)
+    shipments = []
+    # Try common element names - shipment, ship_request, etc.
+    for el in root.findall("shipment") or root.findall("ship_request") or root:
+        if el.tag in ("shipment", "ship_request"):
+            shipments.append(_parse_shipment_element(el))
+        elif not shipments:
+            # If no known tags, parse root children as shipments
+            shipments.append(_parse_shipment_element(el))
+    return shipments
+
+
+def _parse_shipment_element(el: ElementTree.Element) -> dict[str, Any]:
+    """Extract shipment fields. Common EDI 940/945 fields."""
+    return {
+        "shipment_id": _text(el, "shipment_id"),
+        "shipment_num": _text(el, "shipment_num"),
+        "po_num": _text(el, "po_num") or _text(el, "shipment_po/po_num"),
+        "po_id": _text(el, "po_id") or _text(el, "shipment_po/po_id"),
+        "ship_date": _text(el, "ship_date") or _text(el, "shipment_ship_date"),
+        "carrier_name": _text(el, "carrier_name") or _text(el, "carrier/carrier_name"),
+        "carrier_scac": _text(el, "carrier_scac") or _text(el, "carrier/scac"),
+        "bol_number": _text(el, "bol_number") or _text(el, "bol"),
+        "tracking_number": _text(el, "tracking_number") or _text(el, "tracking"),
+        "weight": _text(el, "weight") or _text(el, "shipment_weight"),
+        "weight_uom": _text(el, "weight_uom") or _text(el, "weight_unit"),
+        # Store raw XML for debugging unknown structures
+        "_raw_xml": ElementTree.tostring(el, encoding="unicode")[:2000],
+    }
 
 
 def build_invoice_request_xml(

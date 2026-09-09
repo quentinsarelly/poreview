@@ -694,16 +694,10 @@ def execute_partial_invoicing(
         odoo_move_id=move_id,
     )
 
-    if not clients.config.spring_invoice_enabled:
-        outcome.spring_skipped = (
-            "SPRING_INVOICE_ENABLED is off -- no invoice was sent to Spring/Target."
-        )
-        return outcome
-
-    try:
-        outcome.spring_result = send_spring_invoice(
-            clients, prep.po, prep.invoice_num, prep.invoice_date, qty_overrides=qty_overrides
-        )
-    except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
-        outcome.spring_error = f"{type(e).__name__}: {e}"
+    # Skip Spring for partial invoices -- process manually in Spring to add
+    # shipment data (carrier, BOL, weight) before sending to the retailer.
+    outcome.spring_skipped = (
+        "Partial invoice -- create the invoice manually in Spring from the shipment "
+        "to include carrier/BOL/weight data."
+    )
     return outcome
