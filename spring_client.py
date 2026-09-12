@@ -99,7 +99,7 @@ class SpringSystemsClient:
                 url, auth=(self.api_user, self.api_key), timeout=30
             )
             response.raise_for_status()
-            shipments.extend(_parse_shipments_xml(response.text))
+            shipments.extend(_parse_shipments_json(response.text))
             url = _next_page_url(response.headers)
         return shipments
 
@@ -243,36 +243,41 @@ def _parse_invoices_xml(xml_text: str) -> list[dict[str, Any]]:
     return [_parse_invoice_element(el) for el in root.findall("invoice")]
 
 
-def _parse_shipments_xml(xml_text: str) -> list[dict[str, Any]]:
-    """Parse shipment (940) export response. Fields based on typical EDI 940 structure."""
-    root = ElementTree.fromstring(xml_text)
-    shipments = []
-    # Try common element names - shipment, ship_request, etc.
-    for el in root.findall("shipment") or root.findall("ship_request") or root:
-        if el.tag in ("shipment", "ship_request"):
-            shipments.append(_parse_shipment_element(el))
-        elif not shipments:
-            # If no known tags, parse root children as shipments
-            shipments.append(_parse_shipment_element(el))
-    return shipments
+def _parse_shipments_json(json_text: str) -> list[dict[str, Any]]:
+    """Parse shipment export response (JSON format)."""
+    data = json.loads(json_text)
+    shipments_data = data.get("shipments", {}).get("shipment", [])
+    # Normalize to list (API may return single object or list)
+    if isinstance(shipments_data, dict):
+        shipments_data = [shipments_data]
+    return [_parse_shipment_json(s) for s in shipments_data]
 
 
-def _parse_shipment_element(el: ElementTree.Element) -> dict[str, Any]:
-    """Extract shipment fields. Common EDI 940/945 fields."""
+def _parse_shipment_json(ship: dict[str, Any]) -> dict[str, Any]:
+    """Extract shipment fields from JSON structure."""
+    info = ship.get("ship_info", {})
+    additional = info.get("ship_info_additional", {}).get("attributes", {})
+    weight_data = additional.get("weight", {})
+
+    # Get PO number(s) from the 'po' key
+    po_data = ship.get("po", [])
+    if isinstance(po_data, dict):
+        po_data = [po_data]
+    po_nums = [p.get("po_num") for p in po_data if p.get("po_num")]
+
     return {
-        "shipment_id": _text(el, "shipment_id"),
-        "shipment_num": _text(el, "shipment_num"),
-        "po_num": _text(el, "po_num") or _text(el, "shipment_po/po_num"),
-        "po_id": _text(el, "po_id") or _text(el, "shipment_po/po_id"),
-        "ship_date": _text(el, "ship_date") or _text(el, "shipment_ship_date"),
-        "carrier_name": _text(el, "carrier_name") or _text(el, "carrier/carrier_name"),
-        "carrier_scac": _text(el, "carrier_scac") or _text(el, "carrier/scac"),
-        "bol_number": _text(el, "bol_number") or _text(el, "bol"),
-        "tracking_number": _text(el, "tracking_number") or _text(el, "tracking"),
-        "weight": _text(el, "weight") or _text(el, "shipment_weight"),
-        "weight_uom": _text(el, "weight_uom") or _text(el, "weight_unit"),
-        # Store raw XML for debugging unknown structures
-        "_raw_xml": ElementTree.tostring(el, encoding="unicode")[:2000],
+        "ship_info_id": info.get("ship_info_id"),
+        "carrier_name": info.get("ship_info_carrier_code"),
+        "carrier_scac": additional.get("carrier_scac_code"),
+        "tracking_number": info.get("ship_info_tracking"),
+        "bol_number": additional.get("master_bol"),
+        "ship_date": info.get("ship_info_ship_date"),
+        "weight": weight_data.get("value"),
+        "weight_uom": weight_data.get("unit_of_measure"),
+        "po_nums": po_nums,
+        "vendor_id": info.get("vendor_id"),
+        "retailer_id": info.get("retailer_id"),
+        "_raw": ship,  # Keep full data for debugging
     }
 
 
