@@ -9,6 +9,7 @@ from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
 # action_id of the /po-invoice confirmation button, shared with slack_listener.
 INVOICE_CONFIRM_ACTION = "po_invoice_confirm"
 PARTIAL_INVOICE_CONFIRM_ACTION = "po_partial_invoice_confirm"
+SPRING_INVOICE_CONFIRM_ACTION = "po_spring_invoice_confirm"
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2

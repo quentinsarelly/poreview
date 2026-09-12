@@ -116,11 +116,14 @@ class SpringSystemsClient:
         invoice_date: str | None = None,
         *,
         qty_overrides: dict[str, float] | None = None,
+        shipment_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create/send an invoice for a PO's line items.
 
         qty_overrides: if provided, invoice only items in this map using these
         quantities (SKU → qty). Items not in the map are skipped.
+
+        shipment_data: if provided, include shipment fields (carrier, tracking, weight).
 
         WARNING -- unconfirmed draft-vs-send behavior: Spring's docs do not document
         any way to create a "draft" invoice distinct from one that's immediately
@@ -137,7 +140,8 @@ class SpringSystemsClient:
         this lands correctly on the created invoice before trusting it.
         """
         invoices_xml = build_invoice_request_xml(
-            po, invoice_num, vendor_tp_id, invoice_date, qty_overrides=qty_overrides
+            po, invoice_num, vendor_tp_id, invoice_date,
+            qty_overrides=qty_overrides, shipment_data=shipment_data
         )
         url = f"{self.base_url.rstrip('/')}/invoice-incoming/send"
         response = self.session.post(
@@ -288,11 +292,15 @@ def build_invoice_request_xml(
     invoice_date: str | None,
     *,
     qty_overrides: dict[str, float] | None = None,
+    shipment_data: dict[str, Any] | None = None,
 ) -> ElementTree.Element:
     """Build invoice XML for Spring Systems API.
 
     qty_overrides: if provided, invoice only items in this map using these
     quantities (SKU → qty). Items not in the map are skipped.
+
+    shipment_data: if provided, include shipment fields (carrier, tracking, weight)
+    in the invoice_additional section.
     """
     line_items = get_line_items(po)
     if not line_items:
@@ -339,9 +347,27 @@ def build_invoice_request_xml(
     ElementTree.SubElement(ElementTree.SubElement(invoice_el, "retailer"), "tp_id").text = str(
         po.get("retailer_id", "")
     )
-    if invoice_date:
-        attrs_el = ElementTree.SubElement(ElementTree.SubElement(invoice_el, "invoice_additional"), "attributes")
-        ElementTree.SubElement(attrs_el, "invoice_date").text = invoice_date
+    # Add invoice_additional with date and shipment data
+    if invoice_date or shipment_data:
+        additional_el = ElementTree.SubElement(invoice_el, "invoice_additional")
+        attrs_el = ElementTree.SubElement(additional_el, "attributes")
+        if invoice_date:
+            ElementTree.SubElement(attrs_el, "invoice_date").text = invoice_date
+        if shipment_data:
+            if shipment_data.get("ship_date"):
+                ElementTree.SubElement(attrs_el, "ship_date").text = shipment_data["ship_date"]
+            if shipment_data.get("carrier_name"):
+                ElementTree.SubElement(attrs_el, "carrier_name").text = shipment_data["carrier_name"]
+            if shipment_data.get("carrier_scac"):
+                ElementTree.SubElement(attrs_el, "carrier_scac_code").text = shipment_data["carrier_scac"]
+            if shipment_data.get("tracking_number"):
+                ElementTree.SubElement(attrs_el, "ship_info_tracking").text = shipment_data["tracking_number"]
+            if shipment_data.get("bol_number"):
+                ElementTree.SubElement(attrs_el, "master_bol").text = shipment_data["bol_number"]
+            if shipment_data.get("weight"):
+                weight_el = ElementTree.SubElement(attrs_el, "weight")
+                ElementTree.SubElement(weight_el, "value").text = str(shipment_data["weight"])
+                ElementTree.SubElement(weight_el, "unit_of_measure").text = shipment_data.get("weight_uom", "LB")
 
     invoice_po_el = ElementTree.SubElement(invoice_el, "invoice_po")
     ElementTree.SubElement(invoice_po_el, "po_id").text = str(po.get("po_id", ""))

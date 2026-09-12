@@ -361,12 +361,15 @@ def send_spring_invoice(
     invoice_date: str | None,
     *,
     qty_overrides: dict[str, float] | None = None,
+    shipment_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """WARNING: may transmit an EDI 810 to the retailer -- see
     SpringSystemsClient.create_invoice. Callers must confirm before calling.
 
     qty_overrides: if provided, invoice only items in this map using these
     quantities (SKU → qty). Items not in the map are skipped.
+
+    shipment_data: if provided, include shipment fields (carrier, tracking, weight).
     """
     if not clients.config.spring_vendor_id:
         raise WorkflowError("SPRING_VENDOR_ID is not set. Set it in .env or use --dry-run.")
@@ -376,7 +379,24 @@ def send_spring_invoice(
         clients.config.spring_vendor_id,
         invoice_date=invoice_date,
         qty_overrides=qty_overrides,
+        shipment_data=shipment_data,
     )
+
+
+def find_spring_shipment_for_po(clients: Clients, po_num: str) -> dict[str, Any] | None:
+    """Find the Spring shipment associated with a PO number.
+
+    Searches recent shipments and returns the one whose po_nums contains this PO.
+    Returns None if no matching shipment is found.
+    """
+    # Search shipments from the last 30 days
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    shipments = clients.spring.get_shipments("ship_info_created", "gte", cutoff)
+    for ship in shipments:
+        if po_num in ship.get("po_nums", []):
+            return ship
+    return None
 
 
 def list_invoices_since(clients: Clients, date_str: str) -> list[dict[str, Any]]:

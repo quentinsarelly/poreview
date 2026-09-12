@@ -318,10 +318,49 @@ def main() -> int:
                     return
 
                 outcome = workflow.execute_partial_invoicing(clients, prep)
+                outcome_text = format_invoicing_outcome(outcome)
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"PO {po_num} *partially* invoiced as {outcome.invoice_num} (requested by {user})\n{outcome_text}",
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": slack_notify.SPRING_INVOICE_CONFIRM_ACTION,
+                                "text": {"type": "plain_text", "text": "Create Spring invoice"},
+                                "value": json.dumps({
+                                    "po_num": po_num,
+                                    "shipment_id": shipment_id,
+                                    "invoice_num": outcome.invoice_num,
+                                    "invoice_date": outcome.invoice_date,
+                                }),
+                                "confirm": {
+                                    "title": {"type": "plain_text", "text": "Create Spring invoice?"},
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": (
+                                            f"This will fetch shipment data from Spring and create "
+                                            f"invoice `{outcome.invoice_num}` with carrier/tracking/weight. "
+                                            "The Spring step may transmit an EDI 810 to Target and cannot be undone."
+                                        ),
+                                    },
+                                    "confirm": {"type": "plain_text", "text": "Create"},
+                                    "deny": {"type": "plain_text", "text": "Cancel"},
+                                },
+                            }
+                        ],
+                    },
+                ]
                 respond(
                     replace_original=True,
-                    text=f"PO {po_num} *partially* invoiced as {outcome.invoice_num} (requested by {user})\n"
-                    + format_invoicing_outcome(outcome),
+                    text=f"PO {po_num} partially invoiced as {outcome.invoice_num}",
+                    blocks=blocks,
                 )
             except Exception as e:
                 print(f"Error partial-invoicing {po_num!r} {shipment_id!r}: {e}", file=sys.stderr)
@@ -334,6 +373,77 @@ def main() -> int:
                 )
 
         _in_background(f"po-partial-invoice-confirm {po_num}", work)
+
+    @app.action(slack_notify.SPRING_INVOICE_CONFIRM_ACTION)
+    def handle_spring_invoice_confirm(ack, body, respond):
+        ack()
+        try:
+            payload = json.loads(body["actions"][0]["value"])
+            po_num = payload["po_num"]
+            invoice_num = payload["invoice_num"]
+            invoice_date = payload["invoice_date"]
+        except (KeyError, IndexError, ValueError) as e:
+            print(f"Malformed spring-invoice-confirm payload: {e}", file=sys.stderr)
+            respond(replace_original=False, text=":rotating_light: Couldn't read that button's data.")
+            return
+
+        user = body.get("user", {}).get("username") or body.get("user", {}).get("name", "someone")
+        respond(
+            replace_original=True,
+            text=f":hourglass_flowing_sand: Creating Spring invoice for PO `{po_num}` (requested by {user})...",
+        )
+
+        def work() -> None:
+            try:
+                # Fetch PO and shipment data
+                po = workflow.fetch_po(clients, po_num)
+
+                # Find the Spring shipment for this PO
+                shipment_data = workflow.find_spring_shipment_for_po(clients, po_num)
+                if not shipment_data:
+                    respond(
+                        replace_original=True,
+                        text=f":warning: No Spring shipment found for PO `{po_num}`. "
+                        "Create the invoice manually in Spring.",
+                    )
+                    return
+
+                # Get shipped quantities from Camelot shipment for partial invoice
+                shipment_id = payload.get("shipment_id")
+                qty_overrides = None
+                if shipment_id:
+                    camelot_shipment = clients.camelot.get_shipment_detail(shipment_id)
+                    if camelot_shipment:
+                        from compare_shipment import evaluate_shipment
+                        shipment_result = evaluate_shipment(po, camelot_shipment)
+                        qty_overrides = shipment_result.shipped_items
+
+                # Create the Spring invoice with shipment data
+                result = workflow.send_spring_invoice(
+                    clients, po, invoice_num, invoice_date,
+                    qty_overrides=qty_overrides,
+                    shipment_data=shipment_data,
+                )
+
+                respond(
+                    replace_original=True,
+                    text=(
+                        f":white_check_mark: Spring invoice created for PO `{po_num}` (requested by {user})\n"
+                        f":outbox_tray: Invoice id `{result.get('invoice_id')}`, "
+                        f"status `{result.get('invoice_status')}`, amount {result.get('invoice_amount')}\n"
+                        f":package: Shipment data included: carrier `{shipment_data.get('carrier_name')}`, "
+                        f"tracking `{shipment_data.get('tracking_number')}`, "
+                        f"weight {shipment_data.get('weight')} {shipment_data.get('weight_uom', 'LB')}"
+                    ),
+                )
+            except Exception as e:
+                print(f"Error creating Spring invoice for {po_num!r}: {e}", file=sys.stderr)
+                respond(
+                    replace_original=True,
+                    text=f":rotating_light: Error creating Spring invoice for PO `{po_num}`: {e}",
+                )
+
+        _in_background(f"po-spring-invoice-confirm {po_num}", work)
 
     SocketModeHandler(app, config.slack_app_token).start()
     return 0
