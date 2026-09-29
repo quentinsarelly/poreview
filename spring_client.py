@@ -387,13 +387,42 @@ def build_invoice_request_xml(
     return invoices_el
 
 
-def _parse_invoice_send_response(xml_text: str) -> dict[str, Any]:
+def _parse_invoice_send_response(response_text: str) -> dict[str, Any]:
+    # Spring sometimes returns JSON instead of XML
+    text = response_text.strip()
+    if text.startswith("{"):
+        return _parse_invoice_send_response_json(text)
+    return _parse_invoice_send_response_xml(text)
+
+
+def _parse_invoice_send_response_json(json_text: str) -> dict[str, Any]:
+    """Parse JSON response from invoice creation."""
+    data = json.loads(json_text)
+    # Check for errors
+    if "errors" in data:
+        raise RuntimeError(f"Spring invoice send failed: {data['errors']}")
+    # Extract invoice from response
+    invoices_data = data.get("invoices", {}).get("invoice", [])
+    if isinstance(invoices_data, dict):
+        invoices_data = [invoices_data]
+    if not invoices_data:
+        raise RuntimeError(f"Spring invoice send returned no invoice: {json_text[:500]}")
+    inv = invoices_data[0]
+    return {
+        "invoice_id": str(inv.get("invoice_id", "")),
+        "invoice_num": inv.get("invoice_num", ""),
+        "invoice_amount": str(inv.get("invoice_amount", "")),
+        "invoice_status": str(inv.get("invoice_status", "")),
+    }
+
+
+def _parse_invoice_send_response_xml(xml_text: str) -> dict[str, Any]:
+    """Parse XML response from invoice creation."""
     try:
         root = ElementTree.fromstring(xml_text)
     except ElementTree.ParseError as e:
-        # Show what Spring actually returned (truncated for readability)
         preview = xml_text[:500] if len(xml_text) > 500 else xml_text
-        raise RuntimeError(f"Spring returned invalid XML: {e}\nResponse: {preview!r}") from e
+        raise RuntimeError(f"Spring returned invalid response: {e}\nResponse: {preview!r}") from e
     errors_el = root.find("errors")
     if errors_el is not None:
         raise RuntimeError(f"Spring invoice send failed: {(errors_el.text or '').strip()}")
