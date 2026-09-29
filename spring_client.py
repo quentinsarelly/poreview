@@ -369,6 +369,11 @@ def build_invoice_request_xml(
                 ElementTree.SubElement(weight_el, "value").text = str(shipment_data["weight"])
                 ElementTree.SubElement(weight_el, "unit_of_measure").text = shipment_data.get("weight_uom", "LB")
 
+    # Link to shipment if we have the ship_info_id
+    if shipment_data and shipment_data.get("ship_info_id"):
+        ship_info_el = ElementTree.SubElement(invoice_el, "invoice_ship_info")
+        ElementTree.SubElement(ship_info_el, "ship_info_id").text = str(shipment_data["ship_info_id"])
+
     invoice_po_el = ElementTree.SubElement(invoice_el, "invoice_po")
     ElementTree.SubElement(invoice_po_el, "po_id").text = str(po.get("po_id", ""))
     for item in line_items:

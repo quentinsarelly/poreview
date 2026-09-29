@@ -672,8 +672,11 @@ def execute_invoicing(clients: Clients, prep: InvoicePreparation) -> InvoicingOu
         return outcome
 
     try:
+        # Fetch Spring shipment data to link the invoice to the shipment
+        shipment_data = find_spring_shipment_for_po(clients, prep.po_num)
         outcome.spring_result = send_spring_invoice(
-            clients, prep.po, prep.invoice_num, prep.invoice_date
+            clients, prep.po, prep.invoice_num, prep.invoice_date,
+            shipment_data=shipment_data,
         )
     except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
         outcome.spring_error = f"{type(e).__name__}: {e}"
