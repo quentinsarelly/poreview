@@ -354,10 +354,13 @@ def build_invoice_request_xml(
         if invoice_date:
             ElementTree.SubElement(attrs_el, "invoice_date").text = invoice_date
         if shipment_data:
+            # Use Spring's field names (ship_info_* prefix)
             if shipment_data.get("ship_date"):
-                ElementTree.SubElement(attrs_el, "ship_date").text = shipment_data["ship_date"]
+                # Format as date only (YYYY-MM-DD), not datetime
+                ship_date = shipment_data["ship_date"].split(" ")[0] if " " in shipment_data["ship_date"] else shipment_data["ship_date"]
+                ElementTree.SubElement(attrs_el, "ship_info_ship_date").text = ship_date
             if shipment_data.get("carrier_name"):
-                ElementTree.SubElement(attrs_el, "carrier_name").text = shipment_data["carrier_name"]
+                ElementTree.SubElement(attrs_el, "ship_info_carrier_code").text = shipment_data["carrier_name"]
             if shipment_data.get("carrier_scac"):
                 ElementTree.SubElement(attrs_el, "carrier_scac_code").text = shipment_data["carrier_scac"]
             if shipment_data.get("tracking_number"):
@@ -371,7 +374,8 @@ def build_invoice_request_xml(
 
     # Link to shipment if we have the ship_info_id
     if shipment_data and shipment_data.get("ship_info_id"):
-        ship_info_el = ElementTree.SubElement(invoice_el, "invoice_ship_info")
+        ship_infos_el = ElementTree.SubElement(invoice_el, "invoice_ship_infos")
+        ship_info_el = ElementTree.SubElement(ship_infos_el, "invoice_ship_info")
         ElementTree.SubElement(ship_info_el, "ship_info_id").text = str(shipment_data["ship_info_id"])
 
     invoice_po_el = ElementTree.SubElement(invoice_el, "invoice_po")
