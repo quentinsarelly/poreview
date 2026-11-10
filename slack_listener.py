@@ -445,6 +445,107 @@ def main() -> int:
 
         _in_background(f"po-spring-invoice-confirm {po_num}", work)
 
+    @app.action(slack_notify.DATE_OVERRIDE_ACTION)
+    def handle_date_override(ack, body, respond):
+        ack()
+        try:
+            payload = json.loads(body["actions"][0]["value"])
+            po_num = payload["po_num"]
+            shipment_id = payload["shipment_id"]
+            invoice_num = payload["invoice_num"]
+            invoice_date = payload["invoice_date"]
+            date_source = payload.get("date_source", "unknown")
+        except (KeyError, IndexError, ValueError) as e:
+            print(f"Malformed date-override payload: {e}", file=sys.stderr)
+            respond(replace_original=False, text=":rotating_light: Couldn't read that button's data.")
+            return
+
+        user = body.get("user", {}).get("username") or body.get("user", {}).get("name", "someone")
+        respond(
+            replace_original=True,
+            text=f":hourglass_flowing_sand: Creating invoice for PO `{po_num}` using {date_source} date `{invoice_date}` (requested by {user})...",
+        )
+
+        def work() -> None:
+            try:
+                prep = workflow.prepare_invoice(clients, po_num, shipment_id)
+
+                if not prep.date_override_available:
+                    text, blocks = format_invoice_preparation(prep)
+                    respond(
+                        replace_original=True,
+                        text=text,
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f":no_entry: Nothing invoiced — PO `{po_num}` no longer allows date override.",
+                                },
+                            },
+                            *blocks,
+                        ],
+                    )
+                    return
+
+                outcome = workflow.execute_date_override_invoicing(
+                    clients, prep, invoice_num, invoice_date
+                )
+                outcome_text = format_invoicing_outcome(outcome)
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"PO {po_num} invoiced as {outcome.invoice_num} using {date_source} date (requested by {user})\n{outcome_text}",
+                        },
+                    },
+                ]
+                if outcome.spring_skipped:
+                    blocks.append(
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": slack_notify.SPRING_INVOICE_CONFIRM_ACTION,
+                                    "text": {"type": "plain_text", "text": "Create Spring invoice"},
+                                    "value": json.dumps({
+                                        "po_num": po_num,
+                                        "shipment_id": shipment_id,
+                                        "invoice_num": outcome.invoice_num,
+                                        "invoice_date": outcome.invoice_date,
+                                    }),
+                                    "confirm": {
+                                        "title": {"type": "plain_text", "text": "Create Spring invoice?"},
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": (
+                                                f"Creates invoice *{outcome.invoice_num}* in Spring for *{po_num}*.\n\n"
+                                                "This may transmit an EDI 810 to Target and cannot be undone."
+                                            ),
+                                        },
+                                        "confirm": {"type": "plain_text", "text": "Create"},
+                                        "deny": {"type": "plain_text", "text": "Cancel"},
+                                    },
+                                },
+                            ],
+                        }
+                    )
+                respond(replace_original=True, text=f"PO {po_num} invoiced", blocks=blocks)
+            except Exception as e:
+                print(f"Error invoicing {po_num!r} with date override: {e}", file=sys.stderr)
+                traceback.print_exc()
+                respond(
+                    replace_original=True,
+                    text=(
+                        f":rotating_light: Error invoicing PO `{po_num}` with date override: {e}\n"
+                        "Check Odoo and Spring before retrying -- part of it may have gone through."
+                    ),
+                )
+
+        _in_background(f"po-date-override {po_num}", work)
+
     SocketModeHandler(app, config.slack_app_token).start()
     return 0
 

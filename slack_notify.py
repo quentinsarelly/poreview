@@ -10,6 +10,7 @@ from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
 INVOICE_CONFIRM_ACTION = "po_invoice_confirm"
 PARTIAL_INVOICE_CONFIRM_ACTION = "po_partial_invoice_confirm"
 SPRING_INVOICE_CONFIRM_ACTION = "po_spring_invoice_confirm"
+DATE_OVERRIDE_ACTION = "po_date_override"
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2
@@ -164,6 +165,82 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
             _section(
                 "*Blocking:*\n" + "\n".join(f"• {b}" for b in prep.blockers)
             )
+        )
+
+    # Date override buttons: shown when Camelot and Spring dates disagree.
+    # Allows user to choose which date to use for the invoice.
+    if prep.date_override_available and prep.ship_date_check and prep.invoice_num:
+        camelot_date = prep.ship_date_check.ship_date.strftime("%Y-%m-%d")
+        spring_date = prep.ship_date_check.spring_asn_date.strftime("%Y-%m-%d")
+        spring_invoice_num = prep.invoice_num  # pre-derived using Spring date
+        from invoicing import derive_invoice_num
+        camelot_invoice_num = derive_invoice_num(prep.po_num, prep.ship_date_check.ship_date)
+        blocks.append(
+            _section(
+                f":calendar: *Select invoice date:*\n"
+                f"• *ASN date (recommended):* {spring_date} → invoice `{spring_invoice_num}`\n"
+                f"• *Camelot date:* {camelot_date} → invoice `{camelot_invoice_num}`"
+            )
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": DATE_OVERRIDE_ACTION,
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": f"Use ASN date ({spring_date})"},
+                        "value": json.dumps(
+                            {
+                                "po_num": prep.po_num,
+                                "shipment_id": prep.shipment_id,
+                                "invoice_num": spring_invoice_num,
+                                "invoice_date": spring_date,
+                                "date_source": "spring_asn",
+                            }
+                        ),
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Use ASN date?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"Creates invoice *{spring_invoice_num}* dated `{spring_date}` "
+                                    f"for *{prep.po_num}* using the Spring ASN date."
+                                ),
+                            },
+                            "confirm": {"type": "plain_text", "text": "Create"},
+                            "deny": {"type": "plain_text", "text": "Cancel"},
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "action_id": DATE_OVERRIDE_ACTION,
+                        "text": {"type": "plain_text", "text": f"Use Camelot date ({camelot_date})"},
+                        "value": json.dumps(
+                            {
+                                "po_num": prep.po_num,
+                                "shipment_id": prep.shipment_id,
+                                "invoice_num": camelot_invoice_num,
+                                "invoice_date": camelot_date,
+                                "date_source": "camelot",
+                            }
+                        ),
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Use Camelot date?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"Creates invoice *{camelot_invoice_num}* dated `{camelot_date}` "
+                                    f"for *{prep.po_num}* using the Camelot ship date."
+                                ),
+                            },
+                            "confirm": {"type": "plain_text", "text": "Create"},
+                            "deny": {"type": "plain_text", "text": "Cancel"},
+                        },
+                    },
+                ],
+            }
         )
 
     # Partial invoice button: shown when pricing passes but shipment has

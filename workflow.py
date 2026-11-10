@@ -512,6 +512,9 @@ class InvoicePreparation:
     # what was shipped. partial_total is the sum using shipped quantities.
     partial_shipment_allowed: bool = False
     partial_total: float | None = None
+    # Date override: when Camelot and Spring dates disagree, allow user to choose.
+    # If True, ship_date_check has both dates and user can pick one.
+    date_override_available: bool = False
 
     @property
     def ready(self) -> bool:
@@ -554,6 +557,7 @@ def prepare_invoice(
 
     ship_date_check: invoicing.ShipDateCheck | None = None
     invoice_num: str | None = None
+    date_override_available = False
     try:
         ship_date_check = invoicing.check_ship_date(
             shipment.ship_date, po.get("po_last_asn_date")
@@ -566,6 +570,11 @@ def prepare_invoice(
                 "Resolve which is right before invoicing: this date sets both the "
                 "invoice date and the invoice number."
             )
+            # Allow user to choose which date to use (Spring ASN is recommended)
+            date_override_available = True
+            # Pre-derive invoice_num using Spring ASN date (recommended) so user can see it
+            if ship_date_check.spring_asn_date:
+                invoice_num = invoicing.derive_invoice_num(po_num, ship_date_check.spring_asn_date)
     except invoicing.DerivationError as e:
         blockers.append(str(e))
 
@@ -630,6 +639,7 @@ def prepare_invoice(
         number_resolution=resolution,
         partial_shipment_allowed=partial_shipment_allowed,
         partial_total=partial_total,
+        date_override_available=date_override_available,
     )
 
 
@@ -723,4 +733,46 @@ def execute_partial_invoicing(
         "Partial invoice -- create the invoice manually in Spring from the shipment "
         "to include carrier/BOL/weight data."
     )
+    return outcome
+
+
+def execute_date_override_invoicing(
+    clients: Clients,
+    prep: InvoicePreparation,
+    invoice_num: str,
+    invoice_date: str,
+) -> InvoicingOutcome:
+    """Create invoices using an explicitly chosen date (Camelot or Spring ASN).
+
+    Used when the two date sources disagree and the user manually selects one.
+    """
+    if not prep.date_override_available:
+        raise WorkflowError(
+            f"PO {prep.po_num} does not allow date override. "
+            "Dates must disagree and pricing/shipment must pass."
+        )
+
+    plan = plan_odoo_invoice(clients, prep.po, invoice_num, invoice_date)
+    move_id = create_odoo_invoice(clients, plan)
+
+    outcome = InvoicingOutcome(
+        invoice_num=invoice_num,
+        invoice_date=invoice_date,
+        odoo_move_id=move_id,
+    )
+
+    if not clients.config.spring_invoice_enabled:
+        outcome.spring_skipped = (
+            "SPRING_INVOICE_ENABLED is off -- no invoice was sent to Spring/Target."
+        )
+        return outcome
+
+    try:
+        shipment_data = find_spring_shipment_for_po(clients, prep.po_num)
+        outcome.spring_result = send_spring_invoice(
+            clients, prep.po, invoice_num, invoice_date,
+            shipment_data=shipment_data,
+        )
+    except Exception as e:  # noqa: BLE001 -- reported to the user, not swallowed
+        outcome.spring_error = f"{type(e).__name__}: {e}"
     return outcome
