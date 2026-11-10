@@ -10,7 +10,8 @@ from compare_shipment import ShipmentLineStatus, ShipmentResult, ShipmentStatus
 INVOICE_CONFIRM_ACTION = "po_invoice_confirm"
 PARTIAL_INVOICE_CONFIRM_ACTION = "po_partial_invoice_confirm"
 SPRING_INVOICE_CONFIRM_ACTION = "po_spring_invoice_confirm"
-DATE_OVERRIDE_ACTION = "po_date_override"
+DATE_OVERRIDE_ASN_ACTION = "po_date_override_asn"
+DATE_OVERRIDE_CAMELOT_ACTION = "po_date_override_camelot"
 
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2
@@ -188,7 +189,7 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
                 "elements": [
                     {
                         "type": "button",
-                        "action_id": DATE_OVERRIDE_ACTION,
+                        "action_id": DATE_OVERRIDE_ASN_ACTION,
                         "style": "primary",
                         "text": {"type": "plain_text", "text": f"Use ASN date ({spring_date})"},
                         "value": json.dumps(
@@ -215,7 +216,7 @@ def format_invoice_preparation(prep) -> tuple[str, list[dict]]:
                     },
                     {
                         "type": "button",
-                        "action_id": DATE_OVERRIDE_ACTION,
+                        "action_id": DATE_OVERRIDE_CAMELOT_ACTION,
                         "text": {"type": "plain_text", "text": f"Use Camelot date ({camelot_date})"},
                         "value": json.dumps(
                             {

@@ -445,7 +445,8 @@ def main() -> int:
 
         _in_background(f"po-spring-invoice-confirm {po_num}", work)
 
-    @app.action(slack_notify.DATE_OVERRIDE_ACTION)
+    import re
+    @app.action(re.compile(r"^po_date_override_(asn|camelot)$"))
     def handle_date_override(ack, body, respond):
         ack()
         try:
